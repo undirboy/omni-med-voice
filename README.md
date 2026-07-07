@@ -1,1 +1,0 @@
-# omni-med-voice
