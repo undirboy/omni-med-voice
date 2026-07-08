@@ -1,0 +1,291 @@
+import time
+import threading
+import sys
+
+# --- MONKEY PATCH: Bypass SpeechRecognition's hardcoded PyAudio requirement ---
+import speech_recognition as sr
+class MockPyAudio:
+    def __init__(self, *args, **kwargs): pass
+    def get_sample_size(self, *args, **kwargs): return 2
+sr.AudioSource = object 
+sys.modules['pyaudio'] = MockPyAudio
+
+import cv2
+import mediapipe as mp
+import pyttsx3
+
+class OmniMedUltraSystem:
+    def __init__(self):
+        # --- 1. Audio Keyword & TTS Mapping ---
+        self.recognizer = sr.Recognizer()
+        self.rolling_memory = []
+        
+        self.EMERGENCY_DATABASE = {
+            "help": "Emergency assistance requested immediately! Alerting the nearest medical response team.",
+            "heart attack": "Warning! Acute myocardial infarction detected. Staging Heparin and Aspirin protocols.",
+            "code blue": "Alert! Code Blue situation confirmed. Deploying critical resuscitation assets.",
+            "heparin": "Staging Heparin medication block.",
+            "epinephrine": "Deploying Epinephrine injection unit.",
+            "anaphylaxis": "Critical Alert! Severe anaphylactic shock protocol initiated. Fetching Epinephrine.",
+            "stroke": "Warning! Acute stroke pathway active. Staging tissue plasminogen activator.",
+            "seizure": "Alert! Active patient seizure event detected. Preparing anti-convulsant doses.",
+            "overdose": "Warning! Opioid or narcotic toxicity suspected. Staging Naloxone kits instantly.",
+            "asthma": "Alert! Severe bronchospasm detected. Preparing emergency nebulizer units.",
+            "bleeding": "Trauma Alert! Severe hemorrhage protocol. Staging clotting agents and pressure packs.",
+            "unresponsive": "Alert! Patient is unresponsive. Prepare emergency response team."
+        }
+        
+        self.last_spoken_alert = ""
+
+        # --- 2. Vision Core Setup (Optimized for performance) ---
+        self.mp_hands = mp.solutions.hands
+        self.mp_pose = mp.solutions.pose
+        self.mp_draw = mp.solutions.drawing_utils
+        
+        self.hands = self.mp_hands.Hands(
+            static_image_mode=False, max_num_hands=2,
+            min_detection_confidence=0.5, min_tracking_confidence=0.5
+        )
+        self.pose = self.mp_pose.Pose(
+            static_image_mode=False, model_complexity=0, # Fast lightweight pose engine
+            min_detection_confidence=0.5, min_tracking_confidence=0.5
+        )
+        
+        # --- 3. System Control & Gestures Timers ---
+        self.heart_gesture_start_time = None
+        self.head_gesture_start_time = None
+        self.throat_gesture_start_time = None
+        self.seizure_start_time = None
+        
+        self.active_vision_alert = "NONE"
+        self.is_running = True
+
+        # --- 4. Seizure Spatial Tracking Buffer ---
+        self.motion_history = []
+        self.seizure_buffer_size = 30  # Smoother window 
+
+    def trigger_voice_announcement(self, text_to_speak):
+        def speech_worker():
+            try:
+                engine = pyttsx3.init()
+                engine.setProperty('rate', 160)  
+                engine.say(text_to_speak)
+                engine.runAndWait()
+            except Exception as e:
+                print(f"[TTS ERROR] Voice engine drop: {e}")
+
+        threading.Thread(target=speech_worker, daemon=True).start()
+
+    def clean_expired_memory(self):
+        current_time = time.time()
+        self.rolling_memory = [chunk for chunk in self.rolling_memory if (current_time - chunk[1]) <= 20.0]
+
+    def scan_for_keywords(self):
+        combined_text = " ".join([chunk[0] for chunk in self.rolling_memory])
+        if not combined_text.strip(): return
+        for keyword, warning_speech in self.EMERGENCY_DATABASE.items():
+            if keyword in combined_text:
+                if self.last_spoken_alert != keyword:
+                    self.last_spoken_alert = keyword
+                    self.trigger_voice_announcement(warning_speech)
+                return 
+
+    def start_microphone_stream(self):
+        import sounddevice as sd
+        sample_rate = 16000  
+        while self.is_running:
+            try:
+                duration = 4.0  
+                recording = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1, dtype='int16')
+                sd.wait()  
+                audio_bytes = recording.tobytes()
+                audio_data = sr.AudioData(audio_bytes, sample_rate, 2) 
+                raw_text = self.recognizer.recognize_google(audio_data).lower()
+                if raw_text.strip():
+                    self.rolling_memory.append((raw_text, time.time()))
+                    print(f"🎙️ [MIC HEARD] '{raw_text}'")
+            except Exception: continue
+
+    def continuous_brain_scanner(self):
+        while self.is_running:
+            time.sleep(2)
+            self.clean_expired_memory()
+            self.scan_for_keywords()
+
+    def start_camera_stream(self):
+        cap = cv2.VideoCapture(0)  
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cv2.namedWindow("OmniMed Ultra Dual Tracker", cv2.WINDOW_AUTOSIZE)
+
+        print("[ACTIVE] Lag-optimized multi-gesture & strict seizure check live.\n")
+
+        while cap.isOpened() and self.is_running:
+            ret, frame = cap.read()
+            if not ret: break
+
+            frame = cv2.flip(frame, 1)
+            h, w, c = frame.shape
+            
+            # SPEED PATCH: Downsample frame to 320x240 processing matrix to stop UI lag
+            small_frame = cv2.resize(frame, (320, 240))
+            rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+            
+            pose_results = self.pose.process(rgb_small)
+            tracked_bodies = []
+            
+            if pose_results.pose_landmarks:
+                self.mp_draw.draw_landmarks(frame, pose_results.pose_landmarks, self.mp_pose.POSE_CONNECTIONS)
+                landmarks = pose_results.pose_landmarks.landmark
+                
+                l_sh = landmarks[self.mp_pose.PoseLandmark.LEFT_SHOULDER]
+                r_sh = landmarks[self.mp_pose.PoseLandmark.RIGHT_SHOULDER]
+                nose = landmarks[self.mp_pose.PoseLandmark.NOSE]
+                
+                l_x, l_y = int(l_sh.x * w), int(l_sh.y * h)
+                r_x, r_y = int(r_sh.x * w), int(r_sh.y * h)
+                nose_y = int(nose.y * h)
+                
+                mid_x = (l_x + r_x) // 2
+                mid_y = (l_y + r_y) // 2
+                sh_dist = max(abs(l_x - r_x), 1)
+                
+                if sh_dist > 20:
+                    tracked_bodies.append({
+                        "box_x_start": mid_x - int(sh_dist * 0.45),
+                        "box_x_end": mid_x + int(sh_dist * 0.45),
+                        "box_y_start": mid_y + int(sh_dist * 0.15),
+                        "box_y_end": mid_y + int(sh_dist * 0.75),
+                        "throat_y_start": nose_y + int(sh_dist * 0.10),
+                        "throat_y_end": mid_y,
+                        "head_y_threshold": nose_y + int(sh_dist * 0.25),
+                        "shoulder_y_line": mid_y
+                    })
+
+                # --- RE-CALIBRATED SUSTAINED SEIZURE DETECTION ---
+                r_wrist = landmarks[self.mp_pose.PoseLandmark.RIGHT_WRIST]
+                l_wrist = landmarks[self.mp_pose.PoseLandmark.LEFT_WRIST]
+                
+                self.motion_history.append(((r_wrist.x, r_wrist.y), (l_wrist.x, l_wrist.y)))
+                if len(self.motion_history) > self.seizure_buffer_size:
+                    self.motion_history.pop(0)
+                
+                if len(self.motion_history) == self.seizure_buffer_size:
+                    total_velocity = 0
+                    for i in range(1, len(self.motion_history)):
+                        rw_delta = ((self.motion_history[i][0][0] - self.motion_history[i-1][0][0])**2 + 
+                                    (self.motion_history[i][0][1] - self.motion_history[i-1][0][1])**2)**0.5
+                        lw_delta = ((self.motion_history[i][1][0] - self.motion_history[i-1][1][0])**2 + 
+                                    (self.motion_history[i][1][1] - self.motion_history[i-1][1][1])**2)**0.5
+                        total_velocity += (rw_delta + lw_delta)
+                    
+                    # Normal walking/waving sits below 1.2. Continuous tonic shaking hits > 2.2.
+                    if total_velocity > 2.2:
+                        if self.active_vision_alert == "NONE":
+                            if self.seizure_start_time is None:
+                                self.seizure_start_time = time.time()
+                            # Mandate strict 4.0 second continuous timer delay to ignore false positive random twitches
+                            if time.time() - self.seizure_start_time >= 4.0:
+                                self.active_vision_alert = "SEIZURE"
+                                self.trigger_voice_announcement(self.EMERGENCY_DATABASE["seizure"])
+                    else:
+                        if self.active_vision_alert == "SEIZURE": self.active_vision_alert = "NONE"
+                        self.seizure_start_time = None
+            else:
+                tracked_bodies.append({
+                    "box_x_start": int(w * 0.35), "box_x_end": int(w * 0.65),
+                    "box_y_start": int(h * 0.45), "box_y_end": int(h * 0.85),
+                    "throat_y_start": int(h * 0.30), "throat_y_end": int(h * 0.45),
+                    "head_y_threshold": int(h * 0.30), "shoulder_y_line": int(h * 0.40)
+                })
+                self.seizure_start_time = None
+
+            # 2. Hand Parsing
+            hand_results = self.hands.process(rgb_small)
+            
+            any_hand_on_chest = False
+            any_hand_on_head = False
+            any_hand_on_throat = False
+
+            if hand_results.multi_hand_landmarks:
+                for hand_lms in hand_results.multi_hand_landmarks:
+                    self.mp_draw.draw_landmarks(frame, hand_lms, self.mp_hands.HAND_CONNECTIONS)
+                    
+                    hx = int(hand_lms.landmark[self.mp_hands.HandLandmark.INDEX_FINGER_MCP].x * w)
+                    hy = int(hand_lms.landmark[self.mp_hands.HandLandmark.INDEX_FINGER_MCP].y * h)
+                    
+                    for body in tracked_bodies:
+                        # GESTURE CHECK 1: Throat clutching (Choking)
+                        if (body["box_x_start"] <= hx <= body["box_x_end"]) and (body["throat_y_start"] <= hy <= body["throat_y_end"]):
+                            any_hand_on_throat = True
+                        # GESTURE CHECK 2: Hand resting on Chest (Heart Attack)
+                        elif (body["box_x_start"] <= hx <= body["box_x_end"]) and (body["box_y_start"] <= hy <= body["box_y_end"]):
+                            any_hand_on_chest = True
+                        # GESTURE CHECK 3: Hand resting on Head (Stroke Distress)
+                        elif hy < body["head_y_threshold"] and (body["box_x_start"] - 30 <= hx <= body["box_x_end"] + 30):
+                            any_hand_on_head = True
+
+            # --- 3. DELAY-BASED GESTURE TIMING CORE ---
+            current_time = time.time()
+            
+            # Action 1: Choking Verification Loop (Requires 3.0s continuous hold)
+            if any_hand_on_throat:
+                if self.active_vision_alert == "NONE":
+                    if self.throat_gesture_start_time is None: self.throat_gesture_start_time = current_time
+                    if current_time - self.throat_gesture_start_time >= 3.0:
+                        self.active_vision_alert = "CHOKING"
+                        self.trigger_voice_announcement("Critical Alert! Patient choking gesture detected. Requesting immediate airway clearance assistance.")
+            else: self.throat_gesture_start_time = None
+
+            # Action 2: Chest Check (Requires 4.0s continuous hold)
+            if any_hand_on_chest and not any_hand_on_throat:
+                if self.active_vision_alert == "NONE":
+                    if self.heart_gesture_start_time is None: self.heart_gesture_start_time = current_time
+                    if current_time - self.heart_gesture_start_time >= 4.0:
+                        self.active_vision_alert = "HEART_ATTACK"
+                        self.trigger_voice_announcement("Emergency! Patient chest gesture alert triggered.")
+            else: self.heart_gesture_start_time = None
+
+            # Action 3: Head Check (Requires 4.0s continuous hold)
+            if any_hand_on_head and not any_hand_on_chest and not any_hand_on_throat:
+                if self.active_vision_alert == "NONE":
+                    if self.head_gesture_start_time is None: self.head_gesture_start_time = current_time
+                    if current_time - self.head_gesture_start_time >= 4.0:
+                        self.active_vision_alert = "STROKE_HEAD_TRAUMA"
+                        self.trigger_voice_announcement("Warning! Patient severe head distress gesture detected.")
+            else: self.head_gesture_start_time = None
+
+            # Reset System 
+            if self.active_vision_alert != "SEIZURE" and not any_hand_on_chest and not any_hand_on_head and not any_hand_on_throat:
+                self.active_vision_alert = "NONE"
+
+            # --- 4. HUD RENDERING WINDOW ---
+            for body in tracked_bodies:
+                if self.active_vision_alert == "HEART_ATTACK":
+                    cv2.putText(frame, "CRITICAL: CHEST PAIN GESTURE", (15, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                elif self.active_vision_alert == "STROKE_HEAD_TRAUMA":
+                    cv2.putText(frame, "CRITICAL: POTENTIAL HEAD DISTRESS SIGN", (15, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 128, 255), 2)
+                elif self.active_vision_alert == "CHOKING":
+                    cv2.putText(frame, "CRITICAL: CHOKING AIRWAY OBSTRUCTION", (15, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                elif self.active_vision_alert == "SEIZURE":
+                    cv2.putText(frame, "CRITICAL DETECTED: ACTIVE SEIZURE", (15, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 3)
+                else:
+                    cv2.rectangle(frame, (body["box_x_start"], body["box_y_start"]), (body["box_x_end"], body["box_y_end"]), (0, 255, 0), 2)
+                    cv2.putText(frame, "STATUS: ROOM MONITORING STABLE", (15, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            cv2.imshow("OmniMed Ultra Dual Tracker", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                self.is_running = False
+                break
+
+        cap.release()
+        cv2.destroyAllWindows()
+
+    def boot(self):
+        threading.Thread(target=self.start_microphone_stream, daemon=True).start()
+        threading.Thread(target=self.continuous_brain_scanner, daemon=True).start()
+        self.start_camera_stream()
+
+if __name__ == "__main__":
+    system = OmniMedUltraSystem()
+    system.boot()
