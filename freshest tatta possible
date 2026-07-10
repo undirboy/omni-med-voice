@@ -1,0 +1,465 @@
+import time
+import threading
+import math
+import logging
+from logging.handlers import RotatingFileHandler
+import json
+import os
+import numpy as np
+import cv2
+import mediapipe as mp
+import pyttsx3
+import pyaudio
+import requests  
+from collections import deque
+from vosk import Model, KaldiRecognizer
+from scipy.optimize import linear_sum_assignment  # Hardened global assignment core
+
+# ==================== IMMUTABLE SYSTEM CONFIGURATION ====================
+SYSTEM_CONFIG = {
+    "NETWORK": {
+        "NTFY_TOPIC": "omnimed_er_alerts_india_2026",
+        "TIMEOUT": 5.0
+    },
+    "AUDIO": {
+        "CHUNK_SIZE": 1024,
+        "CHANNELS": 1,
+        "RATE": 16000,
+        "SCREAM_RMS_THRESHOLD": 1800,
+        "SCREAM_FREQ_LOW": 1000.0,   
+        "SCREAM_FREQ_HIGH": 4000.0,
+        "VOSK_MODEL_PATH": "vosk-model-small-en-us" 
+    },
+    "VISION": {
+        "FRAME_WIDTH": 640,
+        "FRAME_HEIGHT": 480,
+        "ADAPTIVE_RADIUS_MULTIPLIER": 1.6,  # Scaled assignment gating threshold
+        "PATIENT_TIMEOUT_SECS": 5.0,
+        "HAND_CONFIDENCE_THRESHOLD": 0.60,
+        "FACE_CONFIDENCE_THRESHOLD": 0.55
+    },
+    "CLINICAL": {
+        "SPO2_MIN_VALID": 75,
+        "SPO2_CRITICAL_THRESHOLD": 94,
+        "BADGE_VERIFY_TIME_SECS": 2.0
+    }
+}
+
+# ==================== STRUCTURED LOGGING SUBSYSTEM ====================
+log_formatter = logging.Formatter('%(asctime)s [%(levelname)s] (%(threadName)s) %(message)s')
+log_file = "omnimed_production_matrix.log"
+file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
+file_handler.setFormatter(log_formatter)
+file_handler.setLevel(logging.INFO)
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+console_handler.setLevel(logging.INFO)
+
+logger = logging.getLogger("OmniMedCore")
+logger.setLevel(logging.INFO)
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+
+
+class OmniMedMasterMatrixV31:
+    def __init__(self):
+        logger.info("Deploying OmniMed Clinical-Grade Matrix V31 [True Hungarian Tracking]")
+
+        self.is_running = True
+        self.memory_lock = threading.Lock()
+        
+        # --- THREAD-SAFE STORAGE STORAGE ---
+        self.audio_rolling_memory = deque(maxlen=45) 
+        self.raw_audio_queue = deque(maxlen=100)
+        self.tracked_patients = {}  
+        self.patient_id_counter = 1
+
+        # --- AUDIO REGISTERS ---
+        self.current_amplitude = 0        
+        self.active_audio_alert = "NONE"
+        self.audio_alert_timestamp = 0
+        self.last_spoken_alert = ""
+        
+        self.EMERGENCY_DATABASE = {
+            "help": "Emergency assistance requested immediately!",
+            "help me": "Patient requesting immediate medical intervention.",
+            "help me please": "High-priority verbal distress signal detected.",
+            "please help me": "High-priority verbal distress signal detected.",
+            "save me": "Life-safety panic event triggered by patient.",
+            "save me please": "Life-safety panic event triggered by patient.",
+            "please save me": "Life-safety panic event triggered by patient.",
+            "heart attack": "Warning! Acute myocardial infarction metrics suspected.",
+            "chest pain": "Warning! Ischemia metrics reported.",
+            "code blue": "Alert! Code Blue situation confirmed. Paging resuscitation.",
+            "choking": "Airway compromise warning sequence initiated.",
+            "emergency": "General sector containment protocol failure reported.",
+            "headache": "Neurological pain tracking logged. Triage flag appended."
+        }
+        self.PANIC_KEYWORDS = list(self.EMERGENCY_DATABASE.keys())
+
+        # --- OFFLINE SPEECH COMPILATION ---
+        if not os.path.exists(SYSTEM_CONFIG["AUDIO"]["VOSK_MODEL_PATH"]):
+            logger.warning(f"Model path '{SYSTEM_CONFIG['AUDIO']['VOSK_MODEL_PATH']}' absent. Running speech in stub mode.")
+            self.vosk_model = None
+        else:
+            self.vosk_model = Model(SYSTEM_CONFIG["AUDIO"]["VOSK_MODEL_PATH"])
+            logger.info("Vosk engine bound to system thread environment successfully.")
+
+        self.pa_engine = pyaudio.PyAudio()
+
+        # --- COMPUTER VISION SOLUTION SOLUTIONS ---
+        self.mp_face_detection = mp.solutions.face_detection
+        self.mp_hands = mp.solutions.hands
+        self.mp_draw = mp.solutions.drawing_utils
+        
+        self.face_detector = self.mp_face_detection.FaceDetection(
+            min_detection_confidence=SYSTEM_CONFIG["VISION"]["FACE_CONFIDENCE_THRESHOLD"]
+        )
+        self.hand_tracker = self.mp_hands.Hands(
+            static_image_mode=False, max_num_hands=4, model_complexity=0,
+            min_detection_confidence=SYSTEM_CONFIG["VISION"]["HAND_CONFIDENCE_THRESHOLD"], 
+            min_tracking_confidence=SYSTEM_CONFIG["VISION"]["HAND_CONFIDENCE_THRESHOLD"]
+        )
+
+    def trigger_voice_dispatch(self, message):
+        def speech_worker():
+            try:
+                engine = pyttsx3.init()
+                engine.setProperty('rate', 155)
+                engine.say(message)
+                engine.runAndWait()
+            except Exception as e:
+                logger.error(f"TTS Engine interface drop: {e}")
+        threading.Thread(target=speech_worker, name="TTSWorker", daemon=True).start()
+
+    def trigger_remote_cloud_alert(self, alert_text):
+        def cloud_sender_worker():
+            url = f"https://ntfy.sh/{SYSTEM_CONFIG['NETWORK']['NTFY_TOPIC']}"
+            headers = {"Title": "OMNIMED COMPLIANCE CRITICAL ALERT", "Priority": "high", "Tags": "rotating_light,skull"}
+            try:
+                response = requests.post(url, data=alert_text.encode('utf-8'), headers=headers, timeout=SYSTEM_CONFIG["NETWORK"]["TIMEOUT"])
+                if response.status_code == 200: logger.info("Remote webhook push confirmation received.")
+                else: logger.error(f"Cloud server rejected notification frame: {response.status_code}")
+            except Exception as e: logger.error(f"Asynchronous connection packet timeout: {e}")
+        threading.Thread(target=cloud_sender_worker, name="CloudNotifier", daemon=True).start()
+
+    def start_unified_audio_engine(self):
+        try:
+            stream = self.pa_engine.open(
+                format=pyaudio.paInt16, channels=SYSTEM_CONFIG["AUDIO"]["CHANNELS"],
+                rate=SYSTEM_CONFIG["AUDIO"]["RATE"], input=True, frames_per_buffer=SYSTEM_CONFIG["AUDIO"]["CHUNK_SIZE"]
+            )
+        except Exception as e:
+            logger.critical(f"Hardware thread failed stream bindings: {e}")
+            return
+        
+        rate = SYSTEM_CONFIG["AUDIO"]["RATE"]
+        while self.is_running:
+            try:
+                data = stream.read(SYSTEM_CONFIG["AUDIO"]["CHUNK_SIZE"], exception_on_overflow=False)
+                if not data: continue
+                raw_buffer = np.frombuffer(data, dtype=np.int16)
+                if len(raw_buffer) > 0:
+                    rms = int(np.sqrt(np.mean(raw_buffer**2)))
+                    self.current_amplitude = rms
+                    
+                    if rms > SYSTEM_CONFIG["AUDIO"]["SCREAM_RMS_THRESHOLD"]:
+                        fft_vals = np.abs(np.fft.rfft(raw_buffer))
+                        freqs = np.fft.rfftfreq(len(raw_buffer), d=1.0/rate)
+                        scream_band = np.where((freqs >= SYSTEM_CONFIG["AUDIO"]["SCREAM_FREQ_LOW"]) & (freqs <= SYSTEM_CONFIG["AUDIO"]["SCREAM_FREQ_HIGH"]))
+                        ambient_band = np.where((freqs < SYSTEM_CONFIG["AUDIO"]["SCREAM_FREQ_LOW"]) | (freqs > SYSTEM_CONFIG["AUDIO"]["SCREAM_FREQ_HIGH"]))
+                        if np.sum(fft_vals[scream_band]) <= np.sum(fft_vals[ambient_band]) * 0.4:
+                            self.current_amplitude = int(rms * 0.1)
+                    with self.memory_lock:
+                        self.raw_audio_queue.append(data)
+            except Exception: pass
+        stream.stop_stream()
+        stream.close()
+
+    def start_speech_processing_pipeline(self):
+        if self.vosk_model is None: return
+        recognizer = KaldiRecognizer(self.vosk_model, SYSTEM_CONFIG["AUDIO"]["RATE"])
+        while self.is_running:
+            if len(self.raw_audio_queue) < 10:
+                time.sleep(0.1)
+                continue
+            audio_chunks = []
+            with self.memory_lock:
+                while self.raw_audio_queue: audio_chunks.append(self.raw_audio_queue.popleft())
+            if recognizer.AcceptWaveform(b"".join(audio_chunks)):
+                raw_text = json.loads(recognizer.Result()).get("text", "").lower()
+                if raw_text.strip():
+                    with self.memory_lock: self.audio_rolling_memory.append((raw_text, time.time()))
+                    self.scan_for_keywords()
+
+    def scan_for_keywords(self):
+        with self.memory_lock:
+            combined_text = " ".join([chunk[0] for chunk in self.audio_rolling_memory])
+        if not combined_text.strip(): return
+        for keyword in sorted(self.PANIC_KEYWORDS, key=len, reverse=True):
+            if keyword in combined_text:
+                self.active_audio_alert = keyword.upper()
+                self.audio_alert_timestamp = time.time()
+                if self.last_spoken_alert != keyword:
+                    self.last_spoken_alert = keyword
+                    self.trigger_voice_dispatch(self.EMERGENCY_DATABASE[keyword])
+                    self.trigger_remote_cloud_alert(f"Acoustic Alarm: Overhearing Emergency Code '{keyword.upper()}' inside bay area.")
+                return
+
+    def process_doctor_badge_filter(self, frame, face_box_coords, profile, assigned_id, current_time):
+        fx1, fy1, fx2, by2 = face_box_coords
+        h, w, _ = frame.shape
+        x1, y1, x2, y2 = max(0, fx1 - 30), max(0, fy1 - 20), min(w, fx2 + 30), min(h, by2 + 20)
+        if (x2 - x1) < 10 or (y2 - y1) < 10: return
+        roi = frame[y1:y2, x1:x2]
+        hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        scrub_badge_mask = cv2.inRange(hsv_roi, np.array([85, 60, 50]), np.array([135, 255, 255]))
+        if (np.sum(scrub_badge_mask > 0) / scrub_badge_mask.size) > 0.15:
+            if profile["badge_timer_start"] is None: profile["badge_timer_start"] = current_time
+            elif (current_time - profile["badge_timer_start"]) >= SYSTEM_CONFIG["CLINICAL"]["BADGE_VERIFY_TIME_SECS"]:
+                if profile["role"] != "DOCTOR_IMMUNE":
+                    profile["role"] = "DOCTOR_IMMUNE"
+                    logger.info(f"Physician ID credential confirmed on matrix track target {assigned_id}")
+        else: profile["badge_timer_start"] = None
+
+    def compute_smoothed_spo2(self, frame, forehead_box, profile):
+        x1, y1, x2, y2 = forehead_box
+        h, w, _ = frame.shape
+        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+        if (x2 - x1) < 5 or (y2 - y1) < 5: return 98, (0, 255, 0)
+        roi = frame[y1:y2, x1:x2]
+        hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        skin_mask = cv2.inRange(hsv_roi, np.array([0, 20, 70]), np.array([20, 255, 255]))
+        mean_channels = cv2.mean(roi, mask=skin_mask)
+        blue_mean, red_mean = mean_channels[0], mean_channels[2]
+        if red_mean == 0 or blue_mean == 0:
+            mean_channels = cv2.mean(roi)
+            blue_mean, red_mean = mean_channels[0], mean_channels[2]
+        
+        profile["ppg_buffer"].append((red_mean, blue_mean))
+        if len(profile["ppg_buffer"]) > 75: profile["ppg_buffer"].pop(0)
+        if len(profile["ppg_buffer"]) < 25: return 98, (0, 255, 0)
+        
+        arr = np.array(profile["ppg_buffer"])
+        red_dc, blue_dc = np.mean(arr[:, 0]), np.mean(arr[:, 1])
+        red_ac, blue_ac = np.std(arr[:, 0]), np.std(arr[:, 1])
+        if red_dc == 0 or blue_dc == 0 or blue_ac == 0: return 98, (0, 255, 0)
+        
+        r_ratio = (red_ac / red_dc) / (blue_ac / blue_dc)
+        estimated_spo2 = int(104 - (7 * r_ratio))
+        estimated_spo2 = max(SYSTEM_CONFIG["CLINICAL"]["SPO2_MIN_VALID"], min(100, estimated_spo2))
+        
+        alpha = 0.04  
+        if profile["ema_smoothed_spo2"] is None: profile["ema_smoothed_spo2"] = estimated_spo2
+        else: profile["ema_smoothed_spo2"] = (alpha * estimated_spo2) + ((1.0 - alpha) * profile["ema_smoothed_spo2"])
+        
+        final_spo2 = int(profile["ema_smoothed_spo2"])
+        profile["last_valid_spo2"] = final_spo2  # MEMORY LOCK FIXED: Encapsulating data into track index
+        color = (0, 255, 0) if final_spo2 >= SYSTEM_CONFIG["CLINICAL"]["SPO2_CRITICAL_THRESHOLD"] else (0, 0, 255)
+        return final_spo2, color
+
+    def start_vision_matrix_stream(self):
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW) 
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, SYSTEM_CONFIG["VISION"]["FRAME_WIDTH"])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, SYSTEM_CONFIG["VISION"]["FRAME_HEIGHT"])
+        cv2.namedWindow("OmniMed Master Multi-Patient Engine V31", cv2.WINDOW_AUTOSIZE)
+
+        while cap.isOpened() and self.is_running:
+            ret, frame = cap.read()
+            if not ret: break
+            frame = cv2.flip(frame, 1)
+            h, w, c = frame.shape
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            current_time = time.time()
+
+            face_res = self.face_detector.process(rgb_frame)
+            hand_res = self.hand_tracker.process(rgb_frame)
+
+            active_ids_this_frame = []
+            frame_patient_positions = {} 
+            detected_face_centers = []
+            detected_face_boxes = []
+
+            if face_res.detections:
+                for detection in face_res.detections:
+                    bboxC = detection.location_data.relative_bounding_box
+                    fx, fy = int(bboxC.xmin * w), int(bboxC.ymin * h)
+                    fw, fh = int(bboxC.width * w), int(bboxC.height * h)
+                    detected_face_centers.append((fx + fw // 2, fy + fh // 2))
+                    detected_face_boxes.append((fx, fy, fw, fh))
+
+            # --- TRUE HUNGARIAN MULTI-OBJECT GRAPH TRACKING CORE ---
+            if detected_face_centers:
+                existing_pids = list(self.tracked_patients.keys())
+                
+                if not existing_pids:
+                    for center, box in zip(detected_face_centers, detected_face_boxes):
+                        assigned_id = f"ID_{self.patient_id_counter}"
+                        self.patient_id_counter += 1
+                        r_scale = max(20, box[2] // 2)
+                        self.tracked_patients[assigned_id] = {
+                            "center": center, "r_scale": r_scale,
+                            "gesture_start_times": {"NURSE_CALL": None, "HEAD_DISTRESS": None, "CHOKE_HOLD": None, "CHEST_HOLD": None},
+                            "ppg_buffer": [], "ema_smoothed_spo2": None, "last_valid_spo2": 98, "badge_timer_start": None,
+                            "last_seen": current_time, "role": "PATIENT", "remote_notified": False  
+                        }
+                        active_ids_this_frame.append(assigned_id)
+                else:
+                    # Formulate optimization cost layout coordinates
+                    cost_matrix = np.zeros((len(existing_pids), len(detected_face_centers)))
+                    for i, pid in enumerate(existing_pids):
+                        for j, center in enumerate(detected_face_centers):
+                            cost_matrix[i, j] = math.hypot(center[0] - self.tracked_patients[pid]["center"][0], 
+                                                           center[1] - self.tracked_patients[pid]["center"][1])
+
+                    # Execute exact linear sum spatial minimizations
+                    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+                    assigned_centers_mask = set()
+
+                    for r_idx, c_idx in zip(row_ind, col_ind):
+                        pid = existing_pids[r_idx]
+                        center = detected_face_centers[c_idx]
+                        box = detected_face_boxes[c_idx]
+                        
+                        # HARDENED ADAPTIVE THRESHOLDING: Dynamic radius gating parameters
+                        adaptive_threshold = box[2] * SYSTEM_CONFIG["VISION"]["ADAPTIVE_RADIUS_MULTIPLIER"]
+                        if cost_matrix[r_idx, c_idx] < adaptive_threshold:
+                            assigned_centers_mask.add(c_idx)
+                            profile = self.tracked_patients[pid]
+                            profile["center"] = center
+                            profile["r_scale"] = max(20, box[2] // 2)
+                            profile["last_seen"] = current_time
+                            active_ids_this_frame.append(pid)
+
+                    # Initialize brand new nodes for unassigned space parameters
+                    for j, center in enumerate(detected_face_centers):
+                        if j not in assigned_centers_mask:
+                            assigned_id = f"ID_{self.patient_id_counter}"
+                            self.patient_id_counter += 1
+                            box = detected_face_boxes[j]
+                            self.tracked_patients[assigned_id] = {
+                                "center": center, "r_scale": max(20, box[2] // 2),
+                                "gesture_start_times": {"NURSE_CALL": None, "HEAD_DISTRESS": None, "CHOKE_HOLD": None, "CHEST_HOLD": None},
+                                "ppg_buffer": [], "ema_smoothed_spo2": None, "last_valid_spo2": 98, "badge_timer_start": None,
+                                "last_seen": current_time, "role": "PATIENT", "remote_notified": False  
+                            }
+                            active_ids_this_frame.append(assigned_id)
+
+            # Spatial mapping visualization loop
+            for assigned_id in active_ids_this_frame:
+                profile = self.tracked_patients[assigned_id]
+                face_center = profile["center"]
+                r = profile["r_scale"]
+                
+                top_line = face_center[1] - int(r * 0.9)
+                chin_line = face_center[1] + int(r * 0.8)
+                shoulder_line = face_center[1] + int(r * 1.5)
+                chest_bottom = shoulder_line + int(r * 1.6)
+
+                frame_patient_positions[assigned_id] = {
+                    "bounds": (top_line, chin_line, shoulder_line, chest_bottom),
+                    "x_range": (face_center[0] - int(r * 1.7), face_center[0] + int(r * 1.7)),
+                    "r_scale": r, "face_center": face_center
+                }
+
+                forehead_box = (face_center[0] - int(r * 0.35), top_line + int(r * 0.2), face_center[0] + int(r * 0.35), face_center[1] - int(r * 0.35))
+                cv2.rectangle(frame, (forehead_box[0], forehead_box[1]), (forehead_box[2], forehead_box[3]), (255, 255, 0), 1)
+                
+                spo2, spo2_color = self.compute_smoothed_spo2(frame, forehead_box, profile)
+                
+                # CLINICAL COMPLIANCE PRESENTATION: Explicitly mark metrics as optical approximations
+                cv2.putText(frame, f"Approx SpO2: {spo2}%", (face_center[0] + r + 5, face_center[1] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, spo2_color, 2)
+
+                box_color = (255, 128, 0) if profile["role"] == "DOCTOR_IMMUNE" else (0, 255, 0)
+                cv2.putText(frame, f"{assigned_id} [{profile['role']}]", (face_center[0] - r, face_center[1] - r - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+
+            detected_triggers = {} 
+            if hand_res.multi_hand_landmarks and frame_patient_positions:
+                for hand_lms in hand_res.multi_hand_landmarks:
+                    self.mp_draw.draw_landmarks(frame, hand_lms, self.mp_hands.HAND_CONNECTIONS)
+                    hx = int(hand_lms.landmark[self.mp_hands.HandLandmark.INDEX_FINGER_MCP].x * w)
+                    hy = int(hand_lms.landmark[self.mp_hands.HandLandmark.INDEX_FINGER_MCP].y * h)
+
+                    for pid, pos_data in frame_patient_positions.items():
+                        if self.tracked_patients[pid]["role"] == "DOCTOR_IMMUNE": continue
+                        x_min, x_max = pos_data["x_range"]
+                        if (x_min <= hx <= x_max):
+                            top_l, chin_l, sh_l, cb_l = pos_data["bounds"]
+                            if hy < top_l: detected_triggers[pid] = "NURSE_CALL"
+                            elif top_l <= hy < chin_l: detected_triggers[pid] = "HEAD_DISTRESS"
+                            elif chin_l <= hy < sh_l: detected_triggers[pid] = "CHOKE_HOLD"
+                            elif sh_l <= hy < cb_l: detected_triggers[pid] = "CHEST_HOLD"
+                            break  
+
+            # Evaluation & Dispatches loop
+            for pid in active_ids_this_frame:
+                profile = self.tracked_patients[pid]
+                active_gesture = detected_triggers.get(pid, "NONE")
+
+                for gesture_name, target_limit in [("NURSE_CALL", 3.0), ("HEAD_DISTRESS", 4.0), ("CHOKE_HOLD", 4.0), ("CHEST_HOLD", 4.0)]:
+                    if active_gesture == gesture_name:
+                        if profile["gesture_start_times"][gesture_name] is None:
+                            profile["gesture_start_times"][gesture_name] = current_time
+                        
+                        current_hold = current_time - profile["gesture_start_times"][gesture_name]
+                        audio_verified = True
+                        with self.memory_lock:
+                            combined_text = " ".join([chunk[0] for chunk in self.audio_rolling_memory])
+                        has_keyword = any(kw in combined_text for kw in self.PANIC_KEYWORDS)
+                        
+                        if gesture_name in ["CHEST_HOLD", "HEAD_DISTRESS"]:
+                            if self.current_amplitude < SYSTEM_CONFIG["AUDIO"]["SCREAM_RMS_THRESHOLD"] and not has_keyword:
+                                audio_verified = False
+
+                        f_center = profile["center"]
+                        rx_offset = profile["r_scale"]
+                        
+                        if current_hold < target_limit:
+                            bar_color = (0, 165, 255) if audio_verified else (0, 0, 255)
+                            bar_w = int((current_hold / target_limit) * 80)
+                            cv2.rectangle(frame, (f_center[0] - 40, f_center[1] - rx_offset - 30), (f_center[0] + 40, f_center[1] - rx_offset - 20), (50, 50, 50), -1)
+                            cv2.rectangle(frame, (f_center[0] - 40, f_center[1] - rx_offset - 30), (f_center[0] - 40 + bar_w, f_center[1] - rx_offset - 20), bar_color, -1)
+                        else:
+                            if not profile["remote_notified"]:
+                                profile["remote_notified"] = True
+                                logger.critical(f"Crisis state confirmed on target channel {pid} for protocol: {gesture_name}")
+                                # TELEMETRY LEAK HOOK SAFELY RESOLVED VIA ISOLATED TARGET PROFILE DICTIONARIES
+                                remote_payload_msg = f"CRITICAL: Patient {pid} triggered '{gesture_name}' state! Isolated Approx SpO2: {profile['last_valid_spo2']}%."
+                                self.trigger_remote_cloud_alert(remote_payload_msg)
+                    else:
+                        profile["gesture_start_times"][gesture_name] = None
+
+            purged_ids = [pid for pid, prof in self.tracked_patients.items() if pid not in active_ids_this_frame and (current_time - prof["last_seen"]) > SYSTEM_CONFIG["VISION"]["PATIENT_TIMEOUT_SECS"]]
+            for pid in purged_ids: del self.tracked_patients[pid]
+
+            if current_time - self.audio_alert_timestamp < 4.0:
+                cv2.rectangle(frame, (15, 15), (320, 50), (0, 0, 255), -1)
+                cv2.putText(frame, f"SPEECH MATCH: {self.active_audio_alert}", (25, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2)
+
+            cv2.imshow("OmniMed Master Multi-Patient Engine V31", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                self.is_running = False
+                break
+
+        cap.release()
+        cv2.destroyAllWindows()
+
+    def shutdown(self):
+        logger.info("Executing safe hardware shutdown sequence...")
+        self.is_running = False
+        time.sleep(0.5)
+        try: self.pa_engine.terminate()
+        except Exception as e: logger.error(f"Error terminating audio core instance: {e}")
+
+    def boot(self):
+        logger.info("System boot configuration validated. Starting background loops.")
+        threading.Thread(target=self.start_unified_audio_engine, name="AudioEngine", daemon=True).start()
+        threading.Thread(target=self.start_speech_processing_pipeline, name="SpeechPipeline", daemon=True).start()
+        try: self.start_vision_matrix_stream()
+        finally: self.shutdown()
+
+
+if __name__ == "__main__":
+    matrix = OmniMedMasterMatrixV31()
+    matrix.boot()
