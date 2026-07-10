@@ -1,0 +1,317 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+import time
+from collections import deque
+from scipy.signal import butter, sosfilt, sosfilt_zi, find_peaks, welch
+from enum import Enum, auto
+
+# ==============================================================================
+# 1. CONFIGURATION
+# ==============================================================================
+class Config:
+    # DSP Settings
+    TARGET_FPS = 15.0
+    WINDOW_SEC = 15
+    BUFFER_SIZE = int(TARGET_FPS * WINDOW_SEC)
+    BANDPASS_LOW = 0.15  # ~9 BPM
+    BANDPASS_HIGH = 0.70 # ~42 BPM
+    
+    # Vision & Tracking Thresholds
+    MIN_VISIBILITY = 0.75
+    MOTION_ROTATION_THRESH = 2.0  # degrees
+    MOTION_VELOCITY_THRESH = 0.05 # normalized px/frame
+    
+    # SQI & Fusion
+    MAX_PHYSIOLOGICAL_BPM_JUMP = 5.0 # Max allowed jump per evaluation
+
+class OmniMedState(Enum):
+    INIT = auto()
+    CALIBRATING = auto()
+    MONITORING = auto()
+    MOTION_RECOVERY = auto()
+
+# ==============================================================================
+# 2. DIGITAL SIGNAL PROCESSING PIPELINE
+# ==============================================================================
+class DSPPipeline:
+    def __init__(self, config: Config):
+        self.cfg = config
+        self.resampled_buffer = deque(maxlen=self.cfg.BUFFER_SIZE)
+        self.filtered_buffer = deque(maxlen=self.cfg.BUFFER_SIZE)
+        
+        # Stateful IIR Filter setup
+        nyq = 0.5 * self.cfg.TARGET_FPS
+        self.sos = butter(2, [self.cfg.BANDPASS_LOW/nyq, self.cfg.BANDPASS_HIGH/nyq], btype='band', output='sos')
+        self.zi_base = sosfilt_zi(self.sos)
+        self.zi = None # Initialized on first sample
+        
+        self.final_bpm = 0.0
+        self.sqi = 0
+        self.snr_db = 0.0
+
+    def reset_state(self):
+        self.resampled_buffer.clear()
+        self.filtered_buffer.clear()
+        self.zi = None
+
+    def process_sample(self, val: float):
+        """Processes a single fixed-timestep sample."""
+        if self.zi is None:
+            self.zi = self.zi_base * val
+            
+        filtered_val, self.zi = sosfilt(self.sos, [val], zi=self.zi)
+        self.resampled_buffer.append(val)
+        self.filtered_buffer.append(filtered_val[0])
+
+    def evaluate_vitals(self):
+        """Runs sensor fusion and updates state."""
+        if len(self.filtered_buffer) < self.cfg.BUFFER_SIZE // 2:
+            return
+            
+        sig = np.array(self.filtered_buffer)
+        sig_std = np.std(sig)
+        if sig_std < 1e-6: return # Avoid div by zero on flatlines
+
+        # A. Time Domain
+        min_dist = int(self.cfg.TARGET_FPS * 1.2)
+        min_width = int(self.cfg.TARGET_FPS * 0.3)
+        peaks, props = find_peaks(sig, prominence=sig_std * 0.25, distance=min_dist, width=min_width)
+        time_bpm = len(peaks) * (60.0 / (len(sig) / self.cfg.TARGET_FPS)) if len(peaks) > 1 else 0
+        
+        # Normalized prominence weight (Relative to signal STD)
+        mean_prom_norm = np.mean(props['prominences']) / sig_std if len(peaks) > 0 else 0
+
+        # B. Frequency Domain (Explicit overlap)
+        nperseg = len(sig) // 2
+        freqs, psd = welch(sig, fs=self.cfg.TARGET_FPS, nperseg=nperseg, noverlap=nperseg // 2)
+        
+        valid_mask = (freqs >= self.cfg.BANDPASS_LOW) & (freqs <= self.cfg.BANDPASS_HIGH)
+        noise_mask = ~valid_mask
+        
+        fft_bpm = 0
+        if np.any(valid_mask):
+            valid_idx = np.where(valid_mask)[0]
+            peak_idx = valid_idx[np.argmax(psd[valid_idx])]
+            fft_bpm = freqs[peak_idx] * 60.0
+            
+            sig_power = psd[peak_idx]
+            noise_power = np.mean(psd[noise_mask]) if np.any(noise_mask) else 1e-6
+            self.snr_db = 10 * np.log10(sig_power / noise_power)
+
+        # C. Fusion & SQI
+        if time_bpm > 0 and fft_bpm > 0:
+            agreement = abs(time_bpm - fft_bpm)
+            
+            # Confidence weighting
+            w_time = min(1.0, mean_prom_norm * 0.5)
+            w_fft = min(1.0, max(0, self.snr_db) / 20.0)
+            total_w = w_time + w_fft if (w_time + w_fft) > 0 else 1.0
+            
+            fused_bpm = ((time_bpm * w_time) + (fft_bpm * w_fft)) / total_w
+            
+            # Physiological Plausibility constraint (Smooth output, limit step changes)
+            if self.final_bpm == 0: 
+                self.final_bpm = fused_bpm
+            else:
+                jump = fused_bpm - self.final_bpm
+                clamped_jump = np.clip(jump, -self.cfg.MAX_PHYSIOLOGICAL_BPM_JUMP, self.cfg.MAX_PHYSIOLOGICAL_BPM_JUMP)
+                self.final_bpm += clamped_jump * 0.25 # EMA smoothing on output
+                
+            # Calibrated SQI mapping
+            self.sqi = max(0, min(100, int((self.snr_db * 2.5) - (agreement * 3) + 50)))
+
+# ==============================================================================
+# 3. VISION & SPATIAL PROCESSOR
+# ==============================================================================
+class VisionProcessor:
+    def __init__(self):
+        self.prev_angle = None
+        self.prev_centroid = None
+
+    def extract_features(self, lms, w, h):
+        """Returns Normalized Area, Minimum Visibility, and a Motion Boolean."""
+        req_idx = [11, 12, 23, 24]
+        min_vis = min(lms[i].visibility for i in req_idx)
+        
+        if min_vis < Config.MIN_VISIBILITY:
+            return 0, min_vis, False
+
+        # 1. Distance Invariant Volume Proxy
+        pts = np.array([(lms[11].x, lms[11].y), (lms[12].x, lms[12].y), 
+                        (lms[24].x, lms[24].y), (lms[23].x, lms[23].y)])
+        x, y = pts[:, 0], pts[:, 1]
+        area = 0.5 * np.abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
+        
+        shoulder_width = np.linalg.norm(pts[0] - pts[1])
+        norm_area = area / (shoulder_width ** 2) if shoulder_width > 0 else 0
+        
+        # 2. Comprehensive Motion Detection (Rotation + Translation)
+        motion_detected = False
+        
+        # Rotation
+        angle = np.degrees(np.arctan2(pts[1][1] - pts[0][1], pts[1][0] - pts[0][0]))
+        if self.prev_angle is not None:
+            delta = ((angle - self.prev_angle + 180) % 360) - 180
+            if abs(delta) > Config.MOTION_ROTATION_THRESH: motion_detected = True
+        self.prev_angle = angle
+        
+        # Translation (Centroid Velocity)
+        centroid = np.mean(pts, axis=0)
+        if self.prev_centroid is not None:
+            velocity = np.linalg.norm(centroid - self.prev_centroid)
+            if velocity > Config.MOTION_VELOCITY_THRESH: motion_detected = True
+        self.prev_centroid = centroid
+        
+        return norm_area, min_vis, motion_detected
+
+# ==============================================================================
+# 4. MAIN APPLICATION (State & Wiring)
+# ==============================================================================
+class OmniMedApp:
+    def __init__(self):
+        self.cfg = Config()
+        self.dsp = DSPPipeline(self.cfg)
+        self.vision = VisionProcessor()
+        
+        self.mp_pose = mp.solutions.pose.Pose(min_detection_confidence=0.8, min_tracking_confidence=0.8)
+        self.mp_draw = mp.solutions.drawing_utils
+        
+        self.state = OmniMedState.INIT
+        self.dt = 1.0 / self.cfg.TARGET_FPS
+        self.next_sample_t = None
+        self.prev_real_t = None
+        self.prev_val = None
+        self.recovery_end_t = 0
+        self.last_eval_t = 0.0
+
+    def draw_ui(self, frame, w, h):
+        cv2.putText(frame, f"State: {self.state.name}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        
+        if self.state == OmniMedState.MONITORING:
+            color = (0, 255, 0) if self.dsp.sqi > 50 else (0, 0, 255)
+            cv2.putText(frame, f"BPM: {self.dsp.final_bpm:.1f}", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 3)
+            cv2.putText(frame, f"SQI: {self.dsp.sqi} | SNR: {self.dsp.snr_db:.1f}dB", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            
+            # --- LIVE GRAPH RENDERING ---
+            if len(self.dsp.filtered_buffer) > 10:
+                x_offset, y_offset, width, height = 20, h - 20, w - 40, 100
+                cv2.rectangle(frame, (x_offset, y_offset - height), (x_offset + width, y_offset), (0, 0, 0), -1)
+                
+                sig = list(self.dsp.filtered_buffer)
+                s_min, s_max = np.min(sig), np.max(sig)
+                
+                if not hasattr(self, 'graph_min'):
+                    self.graph_min, self.graph_max = s_min, s_max
+                self.graph_min = 0.98 * self.graph_min + 0.02 * s_min
+                self.graph_max = 0.98 * self.graph_max + 0.02 * s_max
+                
+                rng = max(self.graph_max - self.graph_min, 1e-6)
+                points = []
+                for i, val in enumerate(sig):
+                    x = int(x_offset + (i / len(sig)) * width)
+                    norm_val = (val - self.graph_min) / rng
+                    y = int(y_offset - (norm_val * height * 0.8) - (height * 0.1))
+                    points.append((x, y))
+                    
+                for i in range(1, len(points)):
+                    cv2.line(frame, points[i-1], points[i], color, 2)
+        
+        elif self.state == OmniMedState.CALIBRATING:
+            pct = int((len(self.dsp.filtered_buffer) / self.cfg.BUFFER_SIZE) * 100)
+            cv2.putText(frame, f"Calibrating: {pct}%", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+            
+        elif self.state == OmniMedState.MOTION_RECOVERY:
+            rem = max(0.0, self.recovery_end_t - time.perf_counter())
+            cv2.putText(frame, f"Motion - Paused ({rem:.1f}s)", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+    def run(self):
+        cap = cv2.VideoCapture(0)
+        print("OmniMed V19.1: Modular DSP Pipeline Ready.")
+        
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret: break
+            frame = cv2.flip(frame, 1)
+            h, w, _ = frame.shape
+            
+            t_now = time.perf_counter()
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pose_res = self.mp_pose.process(rgb)
+            
+            if pose_res.pose_landmarks:
+                lms = pose_res.pose_landmarks.landmark
+                norm_area, min_vis, is_motion = self.vision.extract_features(lms, w, h)
+                
+                # Draw for visual debugging
+                if min_vis >= self.cfg.MIN_VISIBILITY:
+                    self.mp_draw.draw_landmarks(frame, pose_res.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS)
+                
+                # STATE MACHINE 
+                if self.state == OmniMedState.INIT:
+                    if min_vis >= self.cfg.MIN_VISIBILITY:
+                        self.state = OmniMedState.CALIBRATING
+                        self.next_sample_t = t_now + self.dt
+                        self.prev_real_t = t_now
+                        self.prev_val = norm_area
+
+                elif is_motion or min_vis < self.cfg.MIN_VISIBILITY:
+                    if self.state != OmniMedState.MOTION_RECOVERY:
+                        self.state = OmniMedState.MOTION_RECOVERY
+                        self.recovery_end_t = t_now + 1.5
+                        self.dsp.sqi = 0
+                
+                elif self.state == OmniMedState.MOTION_RECOVERY:
+                    if t_now > self.recovery_end_t:
+                        self.state = OmniMedState.CALIBRATING
+                        self.dsp.reset_state()
+                        self.next_sample_t = t_now + self.dt
+                        self.prev_real_t = t_now
+                        self.prev_val = norm_area
+                
+                # FIXED-RATE RESAMPLING ENGINE
+                if self.state in [OmniMedState.CALIBRATING, OmniMedState.MONITORING]:
+                    dt_real = t_now - self.prev_real_t
+                    
+                    if dt_real > 1e-5: # Zero-Division Guard
+                        max_synthetic_samples = int(self.cfg.TARGET_FPS * 0.5) # Max 500ms blind interpolation
+                        synthetic_count = 0
+                        
+                        while self.next_sample_t <= t_now:
+                            if synthetic_count >= max_synthetic_samples:
+                                # Fatal camera stall. Corrupted signal state.
+                                self.state = OmniMedState.MOTION_RECOVERY
+                                self.recovery_end_t = t_now + 1.5 
+                                break
+                                
+                            alpha = (self.next_sample_t - self.prev_real_t) / dt_real
+                            interp_val = self.prev_val + alpha * (norm_area - self.prev_val)
+                            
+                            self.dsp.process_sample(interp_val)
+                            
+                            self.next_sample_t += self.dt
+                            synthetic_count += 1
+                            
+                    self.prev_real_t = t_now
+                    self.prev_val = norm_area
+                    
+                    if self.state == OmniMedState.CALIBRATING and len(self.dsp.filtered_buffer) == self.cfg.BUFFER_SIZE:
+                        self.state = OmniMedState.MONITORING
+                        
+                    # Evaluation Cadence (Throttled to 1 Hz)
+                    if self.state == OmniMedState.MONITORING and (t_now - self.last_eval_t >= 1.0):
+                        self.dsp.evaluate_vitals()
+                        self.last_eval_t = t_now
+
+            self.draw_ui(frame, w, h)
+            cv2.imshow("OmniMed V19.1", frame)
+            if cv2.waitKey(1) == ord('q'): break
+            
+        # Resource Cleanup
+        cap.release()
+        cv2.destroyAllWindows()
+        self.mp_pose.close()
+
+if __name__ == "__main__":
+    app = OmniMedApp()
+    app.run()
