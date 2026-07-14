@@ -1,0 +1,23 @@
+// OpenSCAD Script for slider_drawer.stl
+// All dimensions in millimeters (mm)
+
+payload_w = 40;
+payload_d = 25;
+payload_h = 15; // Match slider thickness to item height
+tolerance = 1;
+
+module slider_drawer() {
+    difference() {
+        // Main flat slider body
+        cube([120, payload_d + 15, payload_h], center=true);
+        
+        // The drop chamber pocket cut completely through the middle
+        cube([payload_w + tolerance, payload_d + tolerance, payload_h + 2], center=true);
+        
+        // Linkage linkage attachment hole at the rear edge (-50mm back)
+        translate([-50, 0, 0])
+            cylinder(h=payload_h + 2, r=1, center=true, $fn=20);
+    }
+}
+
+slider_drawer();
