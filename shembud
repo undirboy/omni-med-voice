@@ -1,0 +1,120 @@
+"""
+===========================================================================
+ Autonomous Emergency Response Robot - Vending Mechanism Assembly
+ Component Layout: Modular Tower, Sliding Piston, and Chassis Floor Guide
+===========================================================================
+"""
+
+// --- SYSTEM PARAMETERS (Modify these to match your medical package size) ---
+item_w = 40;     // Width of your medicine box
+item_d = 25;     // Depth of your medicine box
+item_h = 15;     // Height of your medicine box (Matches slider thickness)
+clearance = 1.0; // Margin so items don't friction-lock inside chambers
+
+// --- CALCULATED DIMENSIONS ---
+slider_w = item_w + clearance + 10;
+slider_d = (item_d + clearance) * 2.5;
+slider_h = item_h; // Strict thickness match to separate single item from stack
+
+tower_wall = 2.0;
+base_thick = 4.0;
+
+// ===========================================================================
+# MODULE 1: THE RECIPIROCATING DRAWER SLIDER (Piston element)
+// ===========================================================================
+module slider_drawer() {
+    difference() {
+        // Main structural piston block
+        cube([slider_w, slider_d, slider_h], center=true);
+        
+        // Target Pocket Chamber (Carries the payload forward)
+        translate([0, (item_d + clearance) / 2, 0])
+            cube([item_w + clearance, item_d + clearance, slider_h + 2], center=true);
+            
+        // Servo Pull Linkage Pin Connection Point at the rear floor wall
+        translate([0, -slider_d/2 + 6, 0])
+            cylinder(h=slider_h + 2, r=1.2, center=true, $fn=20);
+    }
+}
+
+// ===========================================================================
+# MODULE 2: THE FLOOR BASE PLATE & SERVO BRACKET GUIDE
+// ===========================================================================
+module dispenser_base() {
+    guide_w = slider_w + 0.8; // Internal tracking tolerance clearance
+    
+    difference() {
+        union() {
+            // Flat mounting footprint floor plane
+            cube([guide_w + 10, slider_d + 30, base_thick], center=true);
+            
+            // Left Track Guide Retaining Wall
+            translate([-(guide_w + 5)/2, 0, (slider_h)/2])
+                cube([5, slider_d + 30, slider_h + base_thick], center=true);
+                
+            // Right Track Guide Retaining Wall
+            translate([(guide_w + 5)/2, 0, (slider_h)/2])
+                cube([5, slider_d + 30, slider_h + base_thick], center=true);
+                
+            // Backstop Wall & Servo Mounting Blocks
+            translate([0, (slider_d + 30)/2 - 5, (slider_h)/2])
+                cube([guide_w, 10, slider_h + base_thick], center=true);
+        }
+        
+        // THE DROP CHUTE HOLE: Positioned at the front edge of the channel
+        translate([0, -(slider_d)/4, 0])
+            cube([item_w + clearance + 2, item_d + clearance + 2, base_thick + 2], center=true);
+            
+        // Standard SG90 / MG90S Micro Servo Mounting Slot cut out of back wall
+        translate([0, (slider_d + 30)/2 - 5, slider_h/2 + base_thick/2])
+            cube([23.0, 12.5, slider_h + 10], center=true);
+    }
+}
+
+// ===========================================================================
+# MODULE 3: THE GRAVITY FEED HOPPER TOWER CHIMNEY
+// ===========================================================================
+module hopper_tower() {
+    inner_w = item_w + clearance;
+    inner_d = item_d + clearance;
+    tower_h = 100; // Holds roughly 6 standard medicine boxes stacked
+    
+    difference() {
+        // Outer raw extrusion silhouette block
+        cube([inner_w + (tower_wall * 2), inner_d + (tower_wall * 2), tower_h], center=true);
+        
+        // Core chamber extrusion hollow core line cutout
+        cube([inner_w, inner_d, tower_h + 2], center=true);
+        
+        // Pass-through Windows: Allows slider back-plate access at tower baseline floor
+        translate([0, 0, -tower_h/2 + slider_h/2])
+            cube([inner_w + (tower_wall * 3), inner_d, slider_h + 0.5], center=true);
+    }
+}
+
+// ===========================================================================
+// --- RENDER COMPILATION FLAGS ---
+// ===========================================================================
+
+// PREVIEW LAYOUT (Leave this uncommented to view how the system snaps together):
+// ---------------------------------------------------------------------------
+// 1. Base floor plate anchored at origin grid
+dispenser_base();
+
+// 2. Slider Piston inside track channels (Simulated inside home reload configuration)
+color("Cyan") 
+    translate([0, -15, (slider_h + base_thick)/2]) 
+        slider_drawer();
+
+// 3. Hopper Tower Chimney aligned directly over storage channel intersection
+color("Tomato", 0.8) 
+    translate([0, (item_d + clearance)/2 - 15, 100/2 + base_thick/2 + slider_h]) 
+        hopper_tower();
+
+
+// EXPORT GENERATION DIALS:
+// (Uncomment ONLY ONE line below at a time, click "Render (F6)", and export as STL)
+// ---------------------------------------------------------------------------
+// slider_drawer();
+// dispenser_base();
+// hopper_tower();
