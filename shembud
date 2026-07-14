@@ -1,8 +1,10 @@
-// ===========================================================================
-//  Autonomous Emergency Response Robot - Vending Mechanism Assembly (V10.1)
-//  Component Layout: Modular Tower, Sliding Piston, and Chassis Floor Guide
-//  Fixed: Expanded Tower Window Clearance to Prevent Mechanical Jamming
-// ===========================================================================
+/*
+===========================================================================
+  Autonomous Emergency Response Robot - Vending Mechanism Assembly (V10.2)
+  Component Layout: Modular Tower, Sliding Piston, and Chassis Floor Guide
+  Fixed: Standardized Multi-line Comments for Native OpenSCAD Parser
+===========================================================================
+*/
 
 // --- SYSTEM PARAMETERS (Modify these to match your medical package size) ---
 item_w = 40;     // Width of your medicine box
@@ -71,7 +73,7 @@ module dispenser_base() {
 }
 
 // ===========================================================================
-// MODULE 3: THE GRAVITY FEED HOPPER TOWER CHIMNEY (Clearance Restored)
+// MODULE 3: THE GRAVITY FEED HOPPER TOWER CHIMNEY
 // ===========================================================================
 module hopper_tower() {
     inner_w = item_w + clearance;
@@ -85,8 +87,7 @@ module hopper_tower() {
         // Core chamber extrusion hollow core line cutout
         cube([inner_w, inner_d, tower_h + 2], center=true);
         
-        // FIXED: Expanded cut dimensions on Y-axis ([inner_d * 3]) so the moving 
-        // backstop plate of the drawer can pass completely through the tower structure.
+        // Window cut out so moving parts clear smoothly
         translate([0, 0, -tower_h/2 + slider_h/2])
             cube([inner_w + (tower_wall * 4), inner_d * 3, slider_h + 0.6], center=true);
     }
@@ -96,12 +97,12 @@ module hopper_tower() {
 // --- RENDER COMPILATION FLAGS ---
 // ===========================================================================
 
-// PREVIEW LAYOUT (Leave this uncommented to view how the system snaps together):
+// PREVIEW LAYOUT (View how the system snaps together):
 // ---------------------------------------------------------------------------
 // 1. Base floor plate anchored at origin grid
 dispenser_base();
 
-// 2. Slider Piston inside track channels (Simulated inside home reload configuration)
+// 2. Slider Piston inside track channels
 color("Cyan") 
     translate([0, -15, (slider_h + base_thick)/2]) 
         slider_drawer();
@@ -113,7 +114,7 @@ color("Tomato", 0.8)
 
 
 // EXPORT GENERATION DIALS:
-// (Uncomment ONLY ONE line below at a time, click "Render (F6)", and export as STL)
+// (Uncomment ONLY ONE line below at a time, click F6 to render, and export as STL)
 // ---------------------------------------------------------------------------
 // slider_drawer();
 // dispenser_base();
