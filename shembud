@@ -1,9 +1,7 @@
-"""
-===========================================================================
- Autonomous Emergency Response Robot - Vending Mechanism Assembly
- Component Layout: Modular Tower, Sliding Piston, and Chassis Floor Guide
-===========================================================================
-"""
+// ===========================================================================
+//  Autonomous Emergency Response Robot - Vending Mechanism Assembly
+//  Component Layout: Modular Tower, Sliding Piston, and Chassis Floor Guide
+// ===========================================================================
 
 // --- SYSTEM PARAMETERS (Modify these to match your medical package size) ---
 item_w = 40;     // Width of your medicine box
@@ -20,7 +18,7 @@ tower_wall = 2.0;
 base_thick = 4.0;
 
 // ===========================================================================
-# MODULE 1: THE RECIPIROCATING DRAWER SLIDER (Piston element)
+// MODULE 1: THE RECIPROCATING DRAWER SLIDER (Piston element)
 // ===========================================================================
 module slider_drawer() {
     difference() {
@@ -38,7 +36,7 @@ module slider_drawer() {
 }
 
 // ===========================================================================
-# MODULE 2: THE FLOOR BASE PLATE & SERVO BRACKET GUIDE
+// MODULE 2: THE FLOOR BASE PLATE & SERVO BRACKET GUIDE
 // ===========================================================================
 module dispenser_base() {
     guide_w = slider_w + 0.8; // Internal tracking tolerance clearance
@@ -72,7 +70,7 @@ module dispenser_base() {
 }
 
 // ===========================================================================
-# MODULE 3: THE GRAVITY FEED HOPPER TOWER CHIMNEY
+// MODULE 3: THE GRAVITY FEED HOPPER TOWER CHIMNEY
 // ===========================================================================
 module hopper_tower() {
     inner_w = item_w + clearance;
