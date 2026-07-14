@@ -1,6 +1,7 @@
 // ===========================================================================
-//  Autonomous Emergency Response Robot - Vending Mechanism Assembly
+//  Autonomous Emergency Response Robot - Vending Mechanism Assembly (V10.1)
 //  Component Layout: Modular Tower, Sliding Piston, and Chassis Floor Guide
+//  Fixed: Expanded Tower Window Clearance to Prevent Mechanical Jamming
 // ===========================================================================
 
 // --- SYSTEM PARAMETERS (Modify these to match your medical package size) ---
@@ -70,7 +71,7 @@ module dispenser_base() {
 }
 
 // ===========================================================================
-// MODULE 3: THE GRAVITY FEED HOPPER TOWER CHIMNEY
+// MODULE 3: THE GRAVITY FEED HOPPER TOWER CHIMNEY (Clearance Restored)
 // ===========================================================================
 module hopper_tower() {
     inner_w = item_w + clearance;
@@ -84,9 +85,10 @@ module hopper_tower() {
         // Core chamber extrusion hollow core line cutout
         cube([inner_w, inner_d, tower_h + 2], center=true);
         
-        // Pass-through Windows: Allows slider back-plate access at tower baseline floor
+        // FIXED: Expanded cut dimensions on Y-axis ([inner_d * 3]) so the moving 
+        // backstop plate of the drawer can pass completely through the tower structure.
         translate([0, 0, -tower_h/2 + slider_h/2])
-            cube([inner_w + (tower_wall * 3), inner_d, slider_h + 0.5], center=true);
+            cube([inner_w + (tower_wall * 4), inner_d * 3, slider_h + 0.6], center=true);
     }
 }
 
