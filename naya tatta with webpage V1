@@ -1,0 +1,955 @@
+import time
+import sys
+import os
+import threading
+import math
+import cv2
+import numpy as np
+import mediapipe as mp
+import speech_recognition as sr
+from flask import Flask, render_template_string, jsonify, Response, request
+
+# Try to load voice engine silently
+try:
+    import pyttsx3
+    SPEECH_ENGINE_ACTIVE = True
+except ImportError:
+    SPEECH_ENGINE_ACTIVE = False
+
+# ==================== SYSTEM REGISTERS ====================
+app = Flask(__name__)
+frame_lock = threading.Lock()
+database_lock = threading.Lock()
+speech_lock = threading.Lock()
+
+raw_camera_frame = None
+latest_processed_frame = None
+is_system_running = True
+
+# TELEMETRY & AI STATE
+LIVE_TELEMETRY = {
+    "posture_angle": 0,
+    "kinetic_activity": 0,
+    "spo2_level": 99,
+    "room_occupancy": 0,
+    "ai_locking_on": "NONE",
+    "ai_lock_progress": 0
+}
+
+# ALARMS WITH CLINICAL PRIORITY
+LIVE_TRIAGE_ALARMS = {
+    "CHEST_DISTRESS": {"active": False, "acknowledged": False, "priority": 1, "predicted_med": "Aspirin 324mg Chewable", "qty": 1, "spoken_alert": "Critical Chest Distress Detected"},
+    "BREATHING_DISTRESS": {"active": False, "acknowledged": False, "priority": 1, "predicted_med": "Epinephrine Auto-Injector 0.3mg", "qty": 2, "spoken_alert": "Critical Breathing Distress Detected"},
+    "FALL_COLLAPSE": {"active": False, "acknowledged": False, "priority": 1, "predicted_med": "Fentanyl 50mcg IV", "qty": 1, "spoken_alert": "Critical Fall Collapse Confirmed"},
+    "HEAD_DISTRESS": {"active": False, "acknowledged": False, "priority": 2, "predicted_med": "", "qty": 0, "spoken_alert": "Urgent Head Distress Logged"},
+    "HYPOXIA_ALERT": {"active": False, "acknowledged": False, "priority": 2, "predicted_med": "Supplemental O2 Mask", "qty": 1, "spoken_alert": "Patient Hypoxia Warning"},
+    "NURSE_CALL": {"active": False, "acknowledged": False, "priority": 3, "predicted_med": "", "qty": 0, "spoken_alert": "Patient Assistance Requested"}
+}
+
+# CHAT & TASKS
+CHAT_MESSAGES = [{"time": "00:00:00", "sender": "SYSTEM", "target": "ALL", "msg": "OmniMed Neural Net Online. Predictive Medicine Engine ACTIVE."}]
+PHARMACY_ORDERS = []
+NURSE_TASKS = []
+LATEST_EVENTS = {"chat": 0, "pharmacy": 0, "alarm": 0}
+
+# ==================== AUDIO OUT VOICE SYNTHESIS ====================
+def speak_notification(text):
+    """Executes local machine engine text-to-speech without blocking background serial/AI matrices."""
+    if not SPEECH_ENGINE_ACTIVE:
+        return
+    def worker():
+        with speech_lock:
+            try:
+                engine = pyttsx3.init()
+                engine.setProperty('rate', 140)
+                engine.say(text)
+                engine.runAndWait()
+            except Exception:
+                pass
+    threading.Thread(target=worker, daemon=True).start()
+
+# ==================== ROBUST AUDIO ENGINE ====================
+def voice_recognition_worker():
+    recognizer = sr.Recognizer()
+    mic = sr.Microphone()
+    crisis_words = {
+        "help": "NURSE_CALL", "nurse": "NURSE_CALL", 
+        "heart": "CHEST_DISTRESS", "chest": "CHEST_DISTRESS", 
+        "breathe": "BREATHING_DISTRESS", "choking": "BREATHING_DISTRESS",
+        "head": "HEAD_DISTRESS", "dizzy": "HEAD_DISTRESS"
+    }
+    
+    print("[AUDIO CORE] Calibrating Microphone...")
+    try:
+        with mic as source: recognizer.adjust_for_ambient_noise(source, duration=2)
+        print("[AUDIO CORE] Microphone Actively Listening.")
+    except Exception as e:
+        print(f"[AUDIO CORE] Warning: Microphone access failed ({e})")
+        return
+
+    while is_system_running:
+        try:
+            with mic as source: audio = recognizer.listen(source, timeout=1, phrase_time_limit=4)
+            text = recognizer.recognize_google(audio).lower()
+            
+            with database_lock:
+                CHAT_MESSAGES.append({"time": time.strftime('%H:%M:%S'), "sender": "AUDIO_AI", "target": "ALL", "msg": f"Voice Detected: '{text}'"})
+                LATEST_EVENTS["chat"] += 1
+            
+            for word, category in crisis_words.items():
+                if word in text:
+                    with database_lock:
+                        if not LIVE_TRIAGE_ALARMS[category]["active"] and not LIVE_TRIAGE_ALARMS[category]["acknowledged"]:
+                            LIVE_TRIAGE_ALARMS[category]["active"] = True
+                            LIVE_TRIAGE_ALARMS[category]["acknowledged"] = False
+                            LATEST_EVENTS["alarm"] += 1
+                            speak_notification(LIVE_TRIAGE_ALARMS[category]["spoken_alert"])
+                    break
+        except Exception: pass
+
+# ==================== FLASK WEB APP (THE SMART AI UI) ====================
+MASTER_DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>OMNIMED MATRIX</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@700;800&display=swap');
+        
+        :root { --bg: #050505; --panel: #0d0d0d; --border: #222; --cyan: #00e5ff; --red: #ff2a55; --green: #00ff73; --amber: #ffaa00; --text: #ffffff; --text-muted: #777777; }
+        * { box-sizing: border-box; }
+        body { font-family: 'Inter', sans-serif; background-color: var(--bg); color: var(--text); margin: 0; overflow-x: hidden;}
+        .hidden { display: none !important; }
+        
+        /* IN-APP TOAST NOTIFICATIONS */
+        #toast_container { position: fixed; top: 10px; right: 10px; z-index: 10000; display: flex; flex-direction: column; gap: 10px; }
+        .toast { background: rgba(10, 10, 10, 0.95); border-left: 4px solid var(--cyan); padding: 15px; border-radius: 6px; box-shadow: 0 5px 15px rgba(0,0,0,0.8); color: #fff; font-size: 12px; font-weight: 600; animation: slideIn 0.3s ease-out; min-width: 200px;}
+        .toast.toast-danger { border-left-color: var(--red); }
+        .toast.toast-warning { border-left-color: var(--amber); }
+        @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+        
+        /* AUTHENTICATION */
+        #login_screen { display: flex; align-items: center; justify-content: center; height: 100vh; background: radial-gradient(circle, #111 0%, #000 100%); padding: 20px;}
+        .auth-box { background: #0a0a0a; padding: 30px; border: 1px solid var(--border); border-top: 4px solid var(--cyan); border-radius: 8px; width: 100%; max-width: 400px; box-shadow: 0 10px 30px rgba(0,0,0,0.8); }
+        .auth-box h2 { color: #fff; margin-top: 0; font-weight: 800; letter-spacing: 2px; font-size: 20px;}
+        .auth-box h2 span { color: var(--cyan); }
+        .input-group label { display: block; color: var(--text-muted); font-size: 11px; font-weight: 800; text-transform: uppercase; margin-top: 20px; margin-bottom: 8px;}
+        .input-group select, .input-group input { width: 100%; padding: 14px; background: #000; border: 1px solid var(--border); color: #fff; font-family: 'Inter'; border-radius: 4px; outline: none;}
+        .login-btn { width: 100%; margin-top: 30px; padding: 16px; background: var(--cyan); color: #000; font-weight: 800; border: none; border-radius: 4px; cursor: pointer; text-transform:uppercase; letter-spacing: 1px;}
+        .error-msg { color: var(--red); font-size: 12px; margin-top: 15px; font-weight: 800; display: none; text-align: center; }
+        
+        /* NAVBAR */
+        .navbar { display: flex; justify-content: space-between; padding: 15px; background: #050505; border-bottom: 1px solid var(--border); align-items: center;}
+        .brand { font-size: 18px; font-weight: 800;} .brand span { color: var(--cyan); }
+        .role-tag { border: 1px solid var(--border); padding: 4px 10px; border-radius: 20px; font-size: 10px; font-weight: 800; color: #fff; background: #111; text-transform: uppercase;}
+        
+        /* ALARM TAKEOVER OVERLAY */
+        #critical_overlay { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(255, 42, 85, 0.15); border: 8px solid var(--red); z-index: 9999; pointer-events: none; display: none; animation: flash 1s infinite; }
+        @keyframes flash { 0% { opacity: 1; } 50% { opacity: 0.2; } 100% { opacity: 1; } }
+        
+        /* GRID */
+        .grid-container { display: flex; flex-direction: column; gap: 15px; padding: 15px; width: 100%; max-width: 1800px; margin: 0 auto; }
+        @media(min-width: 1024px) { .grid-container { display: grid; grid-template-columns: 350px minmax(600px, 1fr) 400px; align-items: start;} }
+        
+        .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; display: flex; flex-direction: column; overflow:hidden;}
+        .panel-header { background: #0a0a0a; padding: 12px 15px; font-size: 12px; color: var(--text-muted); border-bottom: 1px solid var(--border); font-weight:800; text-transform: uppercase; letter-spacing: 1px;}
+        
+        /* AI LOCKING PROGRESS BAR */
+        .lock-container { background: #000; padding: 12px 15px; border-bottom: 1px solid var(--border); }
+        .lock-text { font-size: 10px; font-weight: 800; color: var(--cyan); margin-bottom: 6px; text-transform: uppercase;}
+        .lock-text.danger { color: var(--red); }
+        .progress-bg { width: 100%; height: 6px; background: #222; border-radius: 10px; overflow: hidden; }
+        .progress-fill { height: 100%; width: 0%; background: var(--cyan); transition: 0.1s linear; }
+        .progress-fill.danger { background: var(--red); }
+
+        /* INSTAGRAM-STYLE DM CHAT */
+        .chat-container { height: 350px; overflow-y: auto; padding: 15px; display: flex; flex-direction: column; gap: 12px; background: #050505;}
+        .msg-wrap { display: flex; flex-direction: column; max-width: 90%; }
+        .msg-sender { font-size: 10px; color: var(--text-muted); margin-bottom: 4px; font-weight: 800;}
+        .msg-bubble { padding: 12px 16px; border-radius: 16px; font-size: 12px; line-height: 1.4; word-wrap: break-word; font-weight: 600;}
+        .msg-self { align-self: flex-end; } .msg-self .msg-bubble { background: #0055ff; color: #fff; border-bottom-right-radius: 4px; } .msg-self .msg-sender { text-align: right; }
+        .msg-other { align-self: flex-start; } .msg-other .msg-bubble { background: #222; color: #fff; border-bottom-left-radius: 4px; border: 1px solid #333;}
+        .target-tag { color: var(--cyan); font-weight: 800; margin-right: 5px;}
+        
+        .chat-target-select { padding: 10px 15px; background: #0a0a0a; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 10px;}
+        .chat-target-select select { background: #000; border: 1px solid var(--border); color: #fff; padding: 8px; border-radius: 4px; flex: 1; outline: none; font-family: 'Inter'; font-size: 11px; font-weight: 600;}
+        .chat-input-area { display: flex; padding: 10px; background: #0a0a0a; border-top: 1px solid var(--border); gap: 10px;}
+        .chat-input-area input { flex: 1; background: #000; border: 1px solid var(--border); color: #fff; padding: 12px 15px; border-radius: 30px; font-family: 'Inter'; outline: none; font-size: 12px;}
+        .chat-input-area button { background: var(--cyan); border: none; color: #000; font-weight: 800; cursor: pointer; padding: 0 15px; border-radius: 30px; font-size: 11px;}
+
+        /* VIDEO, GRAPH & VITALS DIALS */
+        .video-wrapper { display:flex; justify-content:center; background:#000; border-bottom: 1px solid var(--border); position:relative; flex-direction:column;}
+        .video-wrapper img { width: 100%; max-height: 50vh; object-fit: contain; }
+        .gauge-container { display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative; }
+        .gauge-ring {
+            width: 76px; height: 76px;
+            border-radius: 50%;
+            background: conic-gradient(var(--cyan) 0%, #222 0%);
+            display: flex; align-items: center; justify-content: center;
+            transition: background 0.1s linear;
+        }
+        .gauge-inner {
+            width: 64px; height: 64px;
+            background: #000;
+            border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 15px; font-weight: 800;
+        }
+        
+        /* PREDICTIVE MEDICINE DATABASE & SUGGESTIONS */
+        .med-selector { padding: 15px; background: #050505; border-bottom: 1px solid var(--border); transition: 0.3s;}
+        .med-selector select, .med-selector input { width: 100%; padding: 12px; background: #111; border: 1px solid var(--border); color: #fff; border-radius: 4px; margin-bottom: 10px; font-family: 'Inter'; font-size: 12px; transition: 0.3s;}
+        .med-selector button { width: 100%; padding: 14px; background: var(--cyan); border: none; border-radius: 4px; font-weight: 800; color: #000; cursor: pointer; font-size: 11px;}
+        .ai-badge { color: var(--amber); font-size: 10px; font-weight: 800; margin-bottom: 8px; display: block; animation: flashText 1s infinite;}
+        @keyframes flashText { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }
+
+        .list-container { padding: 15px; display: flex; flex-direction: column; gap: 10px; }
+        .list-card { background: #0a0a0a; border: 1px solid var(--border); border-left: 4px solid var(--cyan); padding: 15px; border-radius: 6px; }
+        .list-card.nurse-task { border-left-color: var(--green); }
+        
+        /* PRIORITIZED ALARMS */
+        .alarm-list { padding: 15px; display: flex; flex-direction: column; gap: 10px; }
+        .alarm-card { background: #050505; border: 1px solid var(--border); padding: 15px; border-radius: 6px; transition: 0.2s;}
+        .alarm-card.danger { border: 1px solid var(--red); background: rgba(255, 42, 85, 0.05); border-left: 4px solid var(--red);}
+        .alarm-card.warning { border: 1px solid var(--amber); background: rgba(255, 170, 0, 0.05); border-left: 4px solid var(--amber);}
+        
+        .alarm-priority { font-size: 9px; font-weight: 800; padding: 3px 6px; border-radius: 4px; display: inline-block; margin-bottom: 5px; color: #000;}
+        .pri-1 { background: var(--red); } .pri-2 { background: var(--amber); } .pri-3 { background: var(--cyan); }
+        
+        .alarm-title { font-size: 13px; font-weight: 800; margin-bottom: 5px; color: #fff;}
+        .alarm-status { font-size: 11px; color: var(--text-muted); font-weight: 600;}
+        .danger .alarm-status { color: var(--red); font-weight: 800;}
+        .warning .alarm-status { color: var(--amber); font-weight: 800;}
+        
+        .btn-full { width: 100%; padding: 12px; margin-top: 12px; border: none; border-radius: 4px; font-family: 'Inter'; font-size: 11px; font-weight: 800; cursor: pointer; text-transform: uppercase; background: #222; color: #fff;}
+        .danger .btn-full { background: var(--red); color: #fff; }
+        .warning .btn-full { background: var(--amber); color: #000; }
+    </style>
+</head>
+<body>
+
+    <div id="toast_container"></div>
+    <div id="critical_overlay"></div>
+
+    <div id="login_screen">
+        <div class="auth-box">
+            <h2>OMNIMED <span>CORE</span></h2>
+            <div class="input-group">
+                <label>Identify Staff Role</label>
+                <select id="role_select">
+                    <option value="ATTENDING_DOCTOR">Attending Doctor</option>
+                    <option value="REGISTERED_NURSE">Registered Nurse</option>
+                    <option value="HEAD_PHARMACIST">Head Pharmacist</option>
+                </select>
+            </div>
+            <div class="input-group">
+                <label>Security Passcode</label>
+                <input type="password" id="pass_input" placeholder="Enter PIN (12345678)">
+            </div>
+            <button class="login-btn" onclick="login()">Access Secure Network</button>
+            <div class="error-msg" id="login_error">INCORRECT PASSCODE</div>
+        </div>
+    </div>
+
+    <div id="app_screen" class="hidden">
+        <div class="navbar">
+            <div class="brand">OMNIMED <span>MATRIX</span></div>
+            <div style="display:flex; align-items:center; gap:10px;">
+                <div class="role-tag" id="ui_role"></div>
+                <div style="color:var(--text-muted); font-size:11px; cursor:pointer; font-weight:800;" onclick="location.reload()">LOGOUT</div>
+            </div>
+        </div>
+
+        <div class="grid-container">
+            
+            <div class="panel">
+                <div class="panel-header">Direct Messaging Interface</div>
+                <div class="chat-target-select">
+                    <span style="font-size:10px; font-weight:800; color:var(--text-muted);">TO:</span>
+                    <select id="chat_target">
+                        <option value="ALL">Global Broadcast</option>
+                        <option value="ATTENDING_DOCTOR">Doctor</option>
+                        <option value="REGISTERED_NURSE">Nurse</option>
+                        <option value="HEAD_PHARMACIST">Pharmacist</option>
+                    </select>
+                </div>
+                <div class="chat-container" id="chat_messages"></div>
+                <div class="chat-input-area">
+                    <input type="text" id="chat_inp" placeholder="Message..." onkeypress="if(event.key === 'Enter') sendChat()">
+                    <button onclick="sendChat()">SEND</button>
+                </div>
+            </div>
+
+            <div class="panel" id="center_video">
+                <div class="panel-header">Real-Time Patient Telemetry</div>
+                <div class="lock-container">
+                    <div class="lock-text" id="lock_text">AI SENSORY STATUS: STANDBY</div>
+                    <div class="progress-bg"><div class="progress-fill" id="lock_bar"></div></div>
+                </div>
+                
+                <div class="video-wrapper">
+                    <img src="/video_feed" alt="Camera Offline">
+                    <canvas id="telemetry_graph" width="600" height="80" style="width:100%; height:80px; background:#0a0a0a; border-top:1px solid var(--border);"></canvas>
+                </div>
+                
+                <div class="vitals-grid" style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; padding: 15px 5px; background: #000; gap: 10px;">
+                    <div class="gauge-container">
+                        <div class="gauge-ring" id="ring_o2"><div class="gauge-inner" id="v_o2">--%</div></div>
+                        <div class="label" style="margin-top:8px; font-size:9px; color:var(--text-muted); font-weight:800; letter-spacing:1px; text-transform:uppercase;">SpO2</div>
+                    </div>
+                    <div class="gauge-container">
+                        <div class="gauge-ring" id="ring_angle"><div class="gauge-inner" id="v_angle">--&deg;</div></div>
+                        <div class="label" style="margin-top:8px; font-size:9px; color:var(--text-muted); font-weight:800; letter-spacing:1px; text-transform:uppercase;">Posture</div>
+                    </div>
+                    <div class="gauge-container">
+                        <div class="gauge-ring" id="ring_kin"><div class="gauge-inner" id="v_kin">--%</div></div>
+                        <div class="label" style="margin-top:8px; font-size:9px; color:var(--text-muted); font-weight:800; letter-spacing:1px; text-transform:uppercase;">Kinetic</div>
+                    </div>
+                    <div class="gauge-container">
+                        <div class="gauge-ring" id="ring_occ" style="background:var(--border);"><div class="gauge-inner" id="v_occ" style="color:var(--amber)">--</div></div>
+                        <div class="label" style="margin-top:8px; font-size:9px; color:var(--text-muted); font-weight:800; letter-spacing:1px; text-transform:uppercase;">Occupancy</div>
+                    </div>
+                </div>
+                
+                <div class="med-selector doc-only hidden" id="med_db_panel">
+                    <label style="color:var(--cyan); font-size:10px; font-weight:800; margin-bottom:5px; display:block;">PRESCRIPTION DB</label>
+                    <span class="ai-badge hidden" id="ai_predict_badge">⚡ AI PREDICTIVE AUTO-FILL ACTIVE</span>
+                    
+                    <div id="ai_suggestion_box" class="hidden" style="background: rgba(255,170,0,0.08); border: 1px dashed var(--amber); padding: 10px; border-radius: 4px; margin-bottom: 12px; font-size:11px;">
+                        <span style="color:var(--amber); font-weight:800;">🤖 CORE INFERENCE:</span> 
+                        <span id="ai_suggestion_reason" style="color:#fff;">Patient metrics indicate distress. Auto-configuring treatment routing.</span>
+                    </div>
+
+                    <input list="medicine_list" id="med_search" placeholder="Search medication...">
+                    <datalist id="medicine_list">
+                        <option value="Epinephrine Auto-Injector 0.3mg"><option value="Amiodarone 300mg IV">
+                        <option value="Naloxone 0.4mg Nasal"><option value="Nitroglycerin 0.4mg Sublingual">
+                        <option value="Aspirin 324mg Chewable"><option value="Fentanyl 50mcg IV">
+                    </datalist>
+                    <div style="display:flex; gap:10px;">
+                        <input type="number" id="med_qty" placeholder="Qty" value="1" min="1" max="10" style="width:80px;">
+                        <button onclick="dispatchMedicine()">Issue Order</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="panel hidden" id="center_pharmacy">
+                <div class="panel-header" style="color:var(--cyan);">Pharmacy Dispensation Queue</div>
+                <div class="list-container" id="pharm_queue_list"></div>
+            </div>
+
+            <div class="panel hidden" id="center_nurse">
+                <div class="panel-header" style="color:var(--green);">Triage Task List</div>
+                <div class="list-container" id="nurse_task_list"></div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-header" style="color:var(--cyan);">Emergency Rover Fleet Navigation</div>
+                
+                <div class="vitals-grid" style="display: grid; grid-template-columns: 1fr 1fr 1fr; background:#000; padding:15px; text-align:center; gap:5px;">
+                    <div class="vital-box" style="border:1px solid var(--border); padding:10px 0;"><div class="label">Left Range</div><div class="val" id="prox_left" style="font-size:18px;">-- cm</div></div>
+                    <div class="vital-box" style="border:1px solid var(--border); padding:10px 0;"><div class="label">Front Range</div><div class="val" id="prox_front" style="font-size:18px; color:var(--cyan);">-- cm</div></div>
+                    <div class="vital-box" style="border:1px solid var(--border); padding:10px 0;"><div class="label">Right Range</div><div class="val" id="prox_right" style="font-size:18px;">-- cm</div></div>
+                </div>
+                
+                <div style="padding: 20px; background: #050505; text-align: center;">
+                    <div style="margin-bottom: 10px;">
+                        <button class="login-btn" style="width: auto; padding: 10px 25px; margin:0;" onclick="sendHardwareCommand('F')">▲ FORWARD (W)</button>
+                    </div>
+                    <div style="display: flex; justify-content: center; gap: 10px; margin-bottom: 10px;">
+                        <button class="login-btn" style="width: auto; padding: 10px 25px; margin:0;" onclick="sendHardwareCommand('L')">◀ LEFT (A)</button>
+                        <button class="login-btn" style="width: auto; padding: 10px 25px; margin:0; background: var(--red); color:#fff;" onclick="sendHardwareCommand('S')">🛑 HALT (SPACE)</button>
+                        <button class="login-btn" style="width: auto; padding: 10px 25px; margin:0;" onclick="sendHardwareCommand('R')">RIGHT ▶ (D)</button>
+                    </div>
+                    <div style="margin-bottom: 15px;">
+                        <button class="login-btn" style="width: auto; padding: 10px 25px; margin:0;" onclick="sendHardwareCommand('B')">▼ BACKWARD (S)</button>
+                    </div>
+                    
+                    <div style="border-top: 1px solid var(--border); padding-top: 15px; display: flex; gap: 10px;">
+                        <button class="login-btn" style="flex: 1; margin:0; background: var(--amber); color:#000;" onclick="sendHardwareCommand('O')">🔓 OPEN VAULT</button>
+                        <button class="login-btn" style="flex: 1; margin:0; background: var(--green); color:#000;" onclick="sendHardwareCommand('V')">🌀 DISPENSE COIL</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="panel" id="right_alarms">
+                <div class="panel-header">Active Triage Alerts</div>
+                <div class="alarm-list">
+                    <div id="dynamic_alarms_container"></div>
+                </div>
+            </div>
+
+        </div>
+    </div>
+
+    <script>
+        let currentRole = "";
+        let audioCtx = null;
+        let sirenOsc = null;
+        let spo2HistoryArray = []; 
+
+        function playChime(type) {
+            try {
+                if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                let osc = audioCtx.createOscillator();
+                let gain = audioCtx.createGain();
+                if(type === 'msg') { osc.frequency.setValueAtTime(600, audioCtx.currentTime); osc.type = 'sine'; }
+                else if(type === 'alarm') { osc.frequency.setValueAtTime(400, audioCtx.currentTime); osc.type = 'sawtooth'; }
+                gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.3);
+                osc.connect(gain); gain.connect(audioCtx.destination);
+                osc.start(); osc.stop(audioCtx.currentTime + 0.3);
+            } catch(e){}
+        }
+
+        function startSiren() {
+            try {
+                if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                if(!sirenOsc) {
+                    sirenOsc = audioCtx.createOscillator();
+                    let gain = audioCtx.createGain();
+                    sirenOsc.type = 'square';
+                    sirenOsc.frequency.setValueAtTime(800, audioCtx.currentTime);
+                    setInterval(() => {
+                        if(sirenOsc) { sirenOsc.frequency.setValueAtTime(900, audioCtx.currentTime); sirenOsc.frequency.setValueAtTime(700, audioCtx.currentTime + 0.25); }
+                    }, 500);
+                    gain.gain.value = 0.05;
+                    sirenOsc.connect(gain); gain.connect(audioCtx.destination);
+                    sirenOsc.start();
+                }
+            } catch(e){}
+        }
+
+        function stopSiren() {
+            if(sirenOsc) { sirenOsc.stop(); sirenOsc.disconnect(); sirenOsc = null; }
+        }
+
+        function showToast(msg, type="info") {
+            let container = document.getElementById("toast_container");
+            let toast = document.createElement("div");
+            toast.className = "toast";
+            if(type === "danger") toast.classList.add("toast-danger");
+            if(type === "warning") toast.classList.add("toast-warning");
+            toast.innerText = msg;
+            container.appendChild(toast);
+            setTimeout(() => { toast.remove(); }, 3000);
+        }
+
+        function login() {
+            if(document.getElementById('pass_input').value !== "12345678") {
+                document.getElementById('login_error').style.display = "block"; return;
+            }
+            if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+            currentRole = document.getElementById('role_select').value;
+            document.getElementById('login_screen').classList.add('hidden');
+            document.getElementById('app_screen').classList.remove('hidden');
+            document.getElementById('ui_role').innerText = currentRole.replace('_', ' ');
+            
+            if(currentRole === "HEAD_PHARMACIST") {
+                document.getElementById('center_video').classList.add('hidden');
+                document.getElementById('center_pharmacy').classList.remove('hidden');
+            } else if(currentRole === "REGISTERED_NURSE") {
+                document.getElementById('center_nurse').classList.remove('hidden');
+            } else if(currentRole === "ATTENDING_DOCTOR") {
+                document.querySelectorAll('.doc-only').forEach(e => e.classList.remove('hidden'));
+            }
+        }
+
+        function sendChat() {
+            let msg = document.getElementById('chat_inp').value;
+            let target = document.getElementById('chat_target').value;
+            if(!msg) return;
+            fetch('/api/chat', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({sender: currentRole, target: target, msg: msg}) });
+            document.getElementById('chat_inp').value = "";
+        }
+
+        function acknowledgeAlarm(alarmType) { fetch('/api/ack', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({alarm: alarmType, user: currentRole}) }); }
+        
+        async function sendHardwareCommand(actionChar) {
+            try {
+                const response = await fetch('/api/hardware/command', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ command: actionChar, operator: currentRole })
+                });
+                if (!response.ok) throw new Error();
+            } catch (e) {
+                showToast("Hardware pipeline transmission drop registered", "danger");
+            }
+        }
+
+        window.addEventListener('keydown', (e) => {
+            if (currentRole === "" || document.activeElement.tagName === 'INPUT') return;
+            const key = e.key.toLowerCase();
+            if (key === 'w') sendHardwareCommand('F');
+            else if (key === 'a') sendHardwareCommand('L');
+            else if (key === 's') sendHardwareCommand('B');
+            else if (key === 'd') sendHardwareCommand('R');
+            else if (key === ' ') { e.preventDefault(); sendHardwareCommand('S'); }
+            else if (key === 'o') sendHardwareCommand('O');
+            else if (key === 'v') sendHardwareCommand('V');
+        });
+
+        function dispatchMedicine() {
+            let med = document.getElementById('med_search').value;
+            let qty = document.getElementById('med_qty').value;
+            if(med.trim() === "") return;
+            fetch('/api/pharmacy', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({action: 'ORDER', med: med, qty: qty, doctor: currentRole}) });
+            document.getElementById('med_search').value = "";
+            showToast("Order Dispatched to Pharmacy!", "warning");
+        }
+        function fulfillPrescription(idx) { fetch('/api/pharmacy', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({action: 'FULFILL', index: idx, pharmacist: currentRole}) }); }
+        function completeNurseTask(idx) { fetch('/api/task', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({action: 'COMPLETE', index: idx, nurse: currentRole}) }); }
+
+        let lastCounts = { chat: 0, pharmacy: 0, alarm: 0 };
+        let isAlarming = false;
+
+        function pollData() {
+            if(currentRole === "") return;
+            fetch('/api/data').then(res => res.json()).then(data => {
+                
+                let o2Color = data.telemetry.spo2_level < 90 ? "var(--red)" : "var(--cyan)";
+                document.getElementById('ring_o2').style.background = `conic-gradient(${o2Color} ${data.telemetry.spo2_level}%, #222 0%)`;
+                document.getElementById('v_o2').innerText = data.telemetry.spo2_level + "%";
+                document.getElementById('v_o2').style.color = o2Color;
+
+                let anglePercentage = (data.telemetry.posture_angle / 180) * 100;
+                document.getElementById('ring_angle').style.background = `conic-gradient(var(--amber) ${anglePercentage}%, #222 0%)`;
+                document.getElementById('v_angle').innerText = data.telemetry.posture_angle + "°";
+
+                document.getElementById('ring_kin').style.background = `conic-gradient(var(--green) ${data.telemetry.kinetic_activity}%, #222 0%)`;
+                document.getElementById('v_kin').innerText = data.telemetry.kinetic_activity + "%";
+                document.getElementById('v_occ').innerText = data.telemetry.room_occupancy;
+
+                document.getElementById('prox_left').innerText = data.telemetry.posture_angle + " cm";
+                document.getElementById('prox_front').innerText = data.telemetry.kinetic_activity + " cm";
+                document.getElementById('prox_right').innerText = data.telemetry.spo2_level + " cm";
+
+                spo2HistoryArray.push(data.telemetry.spo2_level);
+                if(spo2HistoryArray.length > 50) spo2HistoryArray.shift();
+
+                let canvas = document.getElementById("telemetry_graph");
+                let ctx = canvas.getContext("2d");
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.beginPath();
+                ctx.strokeStyle = data.telemetry.spo2_level < 90 ? "#ff2a55" : "#00e5ff";
+                ctx.lineWidth = 2;
+                
+                let sliceWidth = canvas.width / 50;
+                for(let i = 0; i < spo2HistoryArray.length; i++) {
+                    let yLoc = canvas.height - ((spo2HistoryArray[i] - 80) / 20) * canvas.height;
+                    let xLoc = i * sliceWidth;
+                    if(i === 0) ctx.moveTo(xLoc, yLoc);
+                    else ctx.lineTo(xLoc, yLoc);
+                }
+                ctx.stroke();
+
+                let l_text = document.getElementById('lock_text');
+                let l_bar = document.getElementById('lock_bar');
+                
+                if(data.telemetry.ai_locking_on !== "NONE") {
+                    l_text.innerText = "DETECTING: " + data.telemetry.ai_locking_on.replace('_', ' ');
+                    l_text.className = "lock-text danger";
+                    l_bar.className = "progress-fill danger";
+                    l_bar.style.width = data.telemetry.ai_lock_progress + "%";
+                } else {
+                    l_text.innerText = "AI SENSORY STATUS: STANDBY";
+                    l_text.className = "lock-text";
+                    l_bar.className = "progress-fill";
+                    l_bar.style.width = "0%";
+                }
+
+                let predictedMed = "";
+                let predictedQty = 1;
+                let topPriority = 99;
+
+                let alarmArray = Object.keys(data.alarms).map(k => { return {id: k, data: data.alarms[k]}; });
+                alarmArray.sort((a, b) => a.data.priority - b.data.priority);
+
+                let alarmsHTML = "";
+                let anyCritical = false;
+
+                alarmArray.forEach(al => {
+                    let cardClass = "alarm-card";
+                    let statText = "Stable";
+                    let btnHTML = "";
+                    
+                    if(al.data.active && !al.data.acknowledged) {
+                        anyCritical = true;
+                        if(al.data.priority === 1) { cardClass = "alarm-card danger"; statText = "CRITICAL ACTION REQUIRED"; }
+                        else if(al.data.priority === 2) { cardClass = "alarm-card warning"; statText = "URGENT ATTENTION"; }
+                        else { cardClass = "alarm-card warning"; statText = "ASSISTANCE NEEDED"; }
+                        
+                        btnHTML = `<button class="btn-full" onclick="acknowledgeAlarm('${al.id}')">Acknowledge Alert</button>`;
+                        
+                        if(al.data.priority < topPriority && al.data.predicted_med !== "") {
+                            topPriority = al.data.priority;
+                            predictedMed = al.data.predicted_med;
+                            predictedQty = al.data.qty;
+                        }
+                    } else if(al.data.acknowledged) {
+                        statText = "Acknowledged";
+                    }
+
+                    alarmsHTML += `
+                        <div class="${cardClass}">
+                            <div class="alarm-priority pri-${al.data.priority}">PRIORITY ${al.data.priority}</div>
+                            <div class="alarm-title">${al.id.replace('_', ' ')}</div>
+                            <div class="alarm-status">${statText}</div>
+                            ${btnHTML}
+                        </div>
+                    `;
+                });
+                document.getElementById('dynamic_alarms_container').innerHTML = alarmsHTML;
+
+                let medInput = document.getElementById('med_search');
+                let qtyInput = document.getElementById('med_qty');
+                let aiBadge = document.getElementById('ai_predict_badge');
+                let reasonBox = document.getElementById('ai_suggestion_box');
+                let reasonText = document.getElementById('ai_suggestion_reason');
+                
+                if(currentRole === "ATTENDING_DOCTOR") {
+                    if (predictedMed !== "" && document.activeElement !== medInput) {
+                        medInput.value = predictedMed;
+                        qtyInput.value = predictedQty;
+                        aiBadge.classList.remove('hidden');
+                        reasonBox.classList.remove('hidden');
+                        medInput.style.borderColor = "var(--amber)";
+                        
+                        if(predictedMed.includes("Aspirin")) reasonText.innerText = "Cardiac profile matched via deep kinetic chest-clutching tracking.";
+                        else if(predictedMed.includes("Epinephrine")) reasonText.innerText = "Airway structural obstruction gesture anomaly confirmed.";
+                        else if(predictedMed.includes("Fentanyl")) reasonText.innerText = "Traumatic high-angle fall acceleration signature logged.";
+                        else if(predictedMed.includes("O2")) reasonText.innerText = "Biometric drop below critical hypoxia boundary limits (<90% SpO2).";
+                    } else if (predictedMed === "") {
+                        aiBadge.classList.add('hidden');
+                        reasonBox.classList.add('hidden');
+                        medInput.style.borderColor = "var(--border)";
+                        if(medInput.value === "Aspirin 324mg Chewable" || medInput.value === "Epinephrine Auto-Injector 0.3mg" || medInput.value === "Fentanyl 50mcg IV" || medInput.value === "Supplemental O2 Mask") {
+                            medInput.value = "";
+                        }
+                    }
+                }
+
+                if(anyCritical && !isAlarming) {
+                    isAlarming = true; document.getElementById('critical_overlay').style.display = "block"; startSiren();
+                } else if (!anyCritical && isAlarming) {
+                    isAlarming = false; document.getElementById('critical_overlay').style.display = "none"; stopSiren();
+                }
+
+                if(data.chats.length !== lastCounts.chat) {
+                    let chatHTML = "";
+                    data.chats.forEach(c => {
+                        if(c.target === "ALL" || c.sender === currentRole || c.target === currentRole || c.sender === "SYSTEM" || c.sender === "AUDIO_AI") {
+                            let isSelf = (c.sender === currentRole);
+                            let wrapClass = isSelf ? "msg-wrap msg-self" : "msg-wrap msg-other";
+                            let senderName = isSelf ? "You" : c.sender.replace('_', ' ');
+                            let tTag = (c.target !== "ALL" && c.sender !== "SYSTEM" && c.sender !== "AUDIO_AI") ? `<span class="target-tag">[@${c.target.replace('_', ' ')}]</span><br>` : "";
+                            chatHTML += `<div class="${wrapClass}"><div class="msg-sender">${senderName} • ${c.time}</div><div class="msg-bubble">${tTag}${c.msg}</div></div>`;
+                        }
+                    });
+                    let chatBox = document.getElementById('chat_messages');
+                    chatBox.innerHTML = chatHTML;
+                    setTimeout(() => { chatBox.scrollTop = chatBox.scrollHeight; }, 50);
+                    if(lastCounts.chat !== 0 && data.chats[data.chats.length-1].sender !== currentRole) playChime('msg');
+                    lastCounts.chat = data.chats.length;
+                }
+
+                if(data.events.pharmacy > lastCounts.pharmacy) {
+                    if(currentRole === "HEAD_PHARMACIST") showToast("New ER Prescription Received!", "danger");
+                    if(currentRole === "REGISTERED_NURSE" && data.events.pharmacy % 2 === 0) showToast("Medication ready for pickup!", "warning");
+                    playChime('alarm'); lastCounts.pharmacy = data.events.pharmacy;
+                }
+
+                if(currentRole === "HEAD_PHARMACIST") {
+                    let p_html = data.pharmacy.length === 0 ? `<div style="color:var(--text-muted); font-size:12px;">No active prescriptions.</div>` : "";
+                    data.pharmacy.forEach((p, i) => {
+                        p_html += `<div class="list-card"><div style="color:var(--cyan); font-weight:800; font-size:14px;">${p.qty}x ${p.med}</div><div style="font-size:10px; color:var(--text-muted); margin-top:5px;">Doctor: ${p.doctor.replace('_', ' ')}</div><button class="btn-full" style="background:#fff; color:#000;" onclick="fulfillPrescription(${i})">Dispense Medication</button></div>`;
+                    });
+                    document.getElementById('pharm_queue_list').innerHTML = p_html;
+                }
+
+                if(currentRole === "REGISTERED_NURSE") {
+                    let n_html = data.nurse_tasks.length === 0 ? `<div style="color:var(--text-muted); font-size:12px;">No pending tasks.</div>` : "";
+                    data.nurse_tasks.forEach((t, i) => {
+                        n_html += `<div class="list-card nurse-task"><div style="color:var(--green); font-weight:800; font-size:14px;">ADMINISTER: ${t.qty}x ${t.med}</div><div style="font-size:10px; color:var(--text-muted); margin-top:5px;">Ordered by: ${t.doctor.replace('_', ' ')}</div><button class="btn-full" style="background:var(--green); color:#000;" onclick="completeNurseTask(${i})">Mark Administered</button></div>`;
+                    });
+                    document.getElementById('nurse_task_list').innerHTML = n_html;
+                }
+            });
+        }
+        setInterval(pollData, 500);
+    </script>
+</body>
+</html>
+"""
+
+# ==================== FLASK ROUTES ====================
+@app.route('/')
+def index(): return render_template_string(MASTER_DASHBOARD_HTML)
+
+@app.route('/api/data')
+def get_data():
+    with database_lock:
+        return jsonify({"telemetry": LIVE_TELEMETRY, "alarms": LIVE_TRIAGE_ALARMS, "chats": CHAT_MESSAGES, "pharmacy": PHARMACY_ORDERS, "nurse_tasks": NURSE_TASKS, "events": LATEST_EVENTS})
+
+@app.route('/api/chat', methods=['POST'])
+def handle_chat():
+    d = request.json
+    with database_lock: 
+        CHAT_MESSAGES.append({"time": time.strftime('%H:%M:%S'), "sender": d['sender'], "target": d['target'], "msg": d['msg']})
+        LATEST_EVENTS["chat"] += 1
+    return jsonify({"status": "OK"})
+
+@app.route('/api/ack', methods=['POST'])
+def handle_ack():
+    d = request.json
+    with database_lock:
+        if d['alarm'] in LIVE_TRIAGE_ALARMS:
+            LIVE_TRIAGE_ALARMS[d['alarm']]["acknowledged"] = True
+            LIVE_TRIAGE_ALARMS[d['alarm']]["active"] = False
+            CHAT_MESSAGES.append({"time": time.strftime('%H:%M:%S'), "sender": "SYSTEM", "target": "ALL", "msg": f"{d['user'].replace('_', ' ')} Acknowledged {d['alarm'].replace('_', ' ')}."})
+            LATEST_EVENTS["chat"] += 1
+    return jsonify({"status": "OK"})
+
+@app.route('/api/pharmacy', methods=['POST'])
+def handle_pharm():
+    d = request.json
+    with database_lock:
+        if d['action'] == 'ORDER':
+            PHARMACY_ORDERS.append({"med": d['med'], "qty": d['qty'], "doctor": d['doctor']})
+            CHAT_MESSAGES.append({"time": time.strftime('%H:%M:%S'), "sender": d['doctor'], "target": "HEAD_PHARMACIST", "msg": f"Requested Dispensation: {d['qty']}x {d['med']}."})
+            LATEST_EVENTS["pharmacy"] += 1
+            LATEST_EVENTS["chat"] += 1
+        elif d['action'] == 'FULFILL':
+            med = PHARMACY_ORDERS.pop(d['index'])
+            NURSE_TASKS.append({"med": med['med'], "qty": med['qty'], "doctor": med['doctor']})
+            CHAT_MESSAGES.append({"time": time.strftime('%H:%M:%S'), "sender": d['pharmacist'], "target": "REGISTERED_NURSE", "msg": f"Medication sent via Tube: {med['qty']}x {med['med']}."})
+            LATEST_EVENTS["pharmacy"] += 1
+            LATEST_EVENTS["chat"] += 1
+    return jsonify({"status": "OK"})
+
+@app.route('/api/task', methods=['POST'])
+def handle_task():
+    d = request.json
+    with database_lock:
+        if d['action'] == 'COMPLETE':
+            task = NURSE_TASKS.pop(d['index'])
+            CHAT_MESSAGES.append({"time": time.strftime('%H:%M:%S'), "sender": d['nurse'], "target": "ALL", "msg": f"Administered {task['qty']}x {task['med']} to patient."})
+            LATEST_EVENTS["chat"] += 1
+    return jsonify({"status": "OK"})
+
+@app.route('/api/hardware/command', methods=['POST'])
+def handle_hardware_command():
+    d = request.json
+    cmd = d.get('command')
+    operator = d.get('operator')
+    
+    if cmd:
+        print(f"[FLEET CORE] Steering Vector Intercepted: '{cmd}' | Operator: {operator}")
+        with database_lock:
+            CHAT_MESSAGES.append({"time": time.strftime('%H:%M:%S'), "sender": "FLEET_CORE", "target": "ALL", "msg": f"Operator Directed Rover Execution Frame: '{cmd}'"})
+            LATEST_EVENTS["chat"] += 1
+        return jsonify({"status": "OK"}), 200
+    return jsonify({"status": "MALFORMED_INPUT"}), 400
+
+def generate_video_stream():
+    global latest_processed_frame
+    while True:
+        with frame_lock:
+            if latest_processed_frame is None: time.sleep(0.01); continue
+            ret, buf = cv2.imencode('.jpg', latest_processed_frame)
+            if not ret: continue
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n\r\n')
+        time.sleep(0.03)
+
+@app.route('/video_feed')
+def video_endpoint(): return Response(generate_video_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+def launch_server(): app.run(host='0.0.0.0', port=5001, debug=False, use_reloader=False)
+
+def hardware_buffer_cleaner(cap):
+    global raw_camera_frame, is_system_running
+    while is_system_running:
+        ret, frame = cap.read()
+        if ret:
+            with frame_lock: raw_camera_frame = frame
+
+# ==================== DUAL-ENGINE AI MATRIX ====================
+class OmniMedAIVision:
+    def __init__(self):
+        self.mp_holistic = mp.solutions.holistic
+        self.tracker = self.mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5, refine_face_landmarks=False)
+        self.mp_draw = mp.solutions.drawing_utils
+        self.pose_spec = self.mp_draw.DrawingSpec(color=(0, 210, 255), thickness=2, circle_radius=2)
+        self.hand_spec = self.mp_draw.DrawingSpec(color=(0, 255, 118), thickness=1, circle_radius=2)
+        
+        self.mp_face_detection = mp.solutions.face_detection
+        self.face_detector = self.mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
+
+        self.timers = {"NURSE_CALL": None, "HEAD_DISTRESS": None, "BREATHING_DISTRESS": None, "CHEST_DISTRESS": None, "FALL_COLLAPSE": None}
+        self.previous_joints = None
+
+    def draw_zone(self, frame, x1, y1, x2, y2, label):
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 100), 1)
+        cv2.putText(frame, label, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 100), 1)
+
+    def run_engine(self, cap):
+        global latest_processed_frame, raw_camera_frame, is_system_running
+        
+        while is_system_running:
+            with frame_lock:
+                if raw_camera_frame is None: time.sleep(0.01); continue
+                frame = raw_camera_frame.copy()
+
+            frame = cv2.flip(frame, 1); h, w, c = frame.shape
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            current_time = time.time()
+            
+            active_gesture = "NONE"
+            lock_progress = 0
+            
+            # --- ROOM RADAR ---
+            face_res = self.face_detector.process(rgb_frame)
+            occupancy = 0
+            if face_res.detections:
+                occupancy = len(face_res.detections)
+                for i, detection in enumerate(face_res.detections):
+                    bboxC = detection.location_data.relative_bounding_box
+                    x, y, w_box, h_box = int(bboxC.xmin * w), int(bboxC.ymin * h), int(bboxC.width * w), int(bboxC.height * h)
+                    cv2.rectangle(frame, (x, y), (x+w_box, y+h_box), (0, 255, 100), 1)
+                    cv2.putText(frame, f"TARGET_{i+1}", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 100), 1)
+            LIVE_TELEMETRY["room_occupancy"] = occupancy
+
+            # --- DEEP BIOMETRICS ---
+            results = self.tracker.process(rgb_frame)
+
+            if results.left_hand_landmarks: self.mp_draw.draw_landmarks(frame, results.left_hand_landmarks, self.mp_holistic.HAND_CONNECTIONS, self.hand_spec, self.hand_spec)
+            if results.right_hand_landmarks: self.mp_draw.draw_landmarks(frame, results.right_hand_landmarks, self.mp_holistic.HAND_CONNECTIONS, self.hand_spec, self.hand_spec)
+
+            if results.pose_landmarks:
+                self.mp_draw.draw_landmarks(frame, results.pose_landmarks, self.mp_holistic.POSE_CONNECTIONS, self.pose_spec, self.pose_spec)
+                nodes = results.pose_landmarks.landmark
+                try:
+                    nose = nodes[0]; l_eye = nodes[2]; r_eye = nodes[5]; l_mouth = nodes[9]; r_mouth = nodes[10]
+                    l_sh = nodes[11]; r_sh = nodes[12]; l_hip = nodes[23]; r_hip = nodes[24]
+                    l_wrist = nodes[15]; r_wrist = nodes[16]
+
+                    nose_y = nose.y * h
+                    eye_y = ((l_eye.y + r_eye.y) / 2) * h
+                    mouth_y = ((l_mouth.y + r_mouth.y) / 2) * h
+                    
+                    head_top_y = int(eye_y - abs(mouth_y - eye_y) * 1.5)
+                    chin_y = int(mouth_y)
+                    shoulder_y = int(((l_sh.y + r_sh.y) / 2) * h)
+                    hip_y = int(((l_hip.y + r_hip.y) / 2) * h)
+                    chest_bottom_y = int(shoulder_y + (hip_y - shoulder_y) * 0.5)
+
+                    avg_sh_x = ((l_sh.x + r_sh.x) / 2) * w
+                    shoulder_w = abs(l_sh.x - r_sh.x) * w
+                    zone_x1 = int(avg_sh_x - shoulder_w * 0.6)
+                    zone_x2 = int(avg_sh_x + shoulder_w * 0.6)
+
+                    self.draw_zone(frame, zone_x1, head_top_y, zone_x2, chin_y, "HEAD ZONE")
+                    self.draw_zone(frame, zone_x1, chin_y, zone_x2, shoulder_y, "BREATHING ZONE")
+                    self.draw_zone(frame, zone_x1, shoulder_y, zone_x2, chest_bottom_y, "CHEST ZONE")
+
+                    angle = int(math.degrees(math.atan2(abs(avg_sh_x - ((l_hip.x + r_hip.x)/2 * w)), abs(hip_y - shoulder_y))))
+                    LIVE_TELEMETRY["posture_angle"] = angle
+
+                    curr_joints = np.array([[n.x, n.y] for n in [nose, l_sh, r_sh, l_wrist, r_wrist]])
+                    if self.previous_joints is not None:
+                        delta = np.sum(np.abs(curr_joints - self.previous_joints))
+                        LIVE_TELEMETRY["kinetic_activity"] = min(100, int(delta * 1200))
+                    self.previous_joints = curr_joints
+
+                    l_y, r_y = l_wrist.y * h, r_wrist.y * h
+                    l_x, r_x = l_wrist.x * w, r_wrist.x * w
+                    
+                    is_central_l = zone_x1 < l_x < zone_x2
+                    is_central_r = zone_x1 < r_x < zone_x2
+
+                    is_nurse = (l_y < head_top_y) or (r_y < head_top_y)
+                    is_head = (not is_nurse) and ((head_top_y <= l_y < chin_y and is_central_l) or (head_top_y <= r_y < chin_y and is_central_r))
+                    is_breathing = (not is_nurse and not is_head) and ((chin_y <= l_y < shoulder_y and is_central_l) or (chin_y <= r_y < shoulder_y and is_central_r))
+                    is_chest = (not is_nurse and not is_head and not is_breathing) and ((shoulder_y <= l_y < chest_bottom_y and is_central_l) or (shoulder_y <= r_y < chest_bottom_y and is_central_r))
+
+                    is_falling = angle > 65
+
+                    if is_breathing or is_falling: LIVE_TELEMETRY["spo2_level"] = max(82, LIVE_TELEMETRY["spo2_level"] - 1)
+                    else: LIVE_TELEMETRY["spo2_level"] = min(99, LIVE_TELEMETRY["spo2_level"] + 1)
+                    if LIVE_TELEMETRY["spo2_level"] < 90:
+                        with database_lock:
+                            if not LIVE_TRIAGE_ALARMS["HYPOXIA_ALERT"]["active"] and not LIVE_TRIAGE_ALARMS["HYPOXIA_ALERT"]["acknowledged"]:
+                                LIVE_TRIAGE_ALARMS["HYPOXIA_ALERT"]["active"] = True
+                                speak_notification(LIVE_TRIAGE_ALARMS["HYPOXIA_ALERT"]["spoken_alert"])
+
+                    def process_gesture(key, condition, req_time=3.0):
+                        nonlocal active_gesture, lock_progress
+                        if condition and not LIVE_TRIAGE_ALARMS[key]["active"]:
+                            if self.timers[key] is None: self.timers[key] = current_time
+                            elapsed = current_time - self.timers[key]
+                            active_gesture = key
+                            lock_progress = min(100, int((elapsed / req_time) * 100))
+                            
+                            cv2.circle(frame, (w//2, h//2), 80, (0,0,255), -1)
+                            cv2.circle(frame, (w//2, h//2), int(80*(elapsed/req_time)), (0,240,255), 4)
+                            cv2.putText(frame, f"LOCKING: {req_time-elapsed:.1f}s", (w//2 - 60, h//2 + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+                            
+                            if elapsed >= req_time:
+                                with database_lock:
+                                    LIVE_TRIAGE_ALARMS[key]["active"] = True
+                                    LIVE_TRIAGE_ALARMS[key]["acknowledged"] = False
+                                    CHAT_MESSAGES.append({"time": time.strftime('%H:%M:%S'), "sender": "SYSTEM", "target": "ALL", "msg": f"CRITICAL ALARM: {key.replace('_', ' ')} DETECTED!"})
+                                    LATEST_EVENTS["alarm"] += 1
+                                    speak_notification(LIVE_TRIAGE_ALARMS[key]["spoken_alert"])
+                                self.timers[key] = None
+                        else:
+                            if self.timers[key] is not None:
+                                self.timers[key] = None
+
+                    if is_falling: process_gesture("FALL_COLLAPSE", is_falling)
+                    elif is_chest: process_gesture("CHEST_DISTRESS", is_chest)
+                    elif is_breathing: process_gesture("BREATHING_DISTRESS", is_breathing)
+                    elif is_head: process_gesture("HEAD_DISTRESS", is_head)
+                    elif is_nurse: process_gesture("NURSE_CALL", is_nurse, 2.0)
+                    else:
+                        for k in self.timers.keys(): self.timers[k] = None
+
+                except Exception as e: pass
+
+            LIVE_TELEMETRY["ai_locking_on"] = active_gesture
+            LIVE_TELEMETRY["ai_lock_progress"] = lock_progress
+
+            cv2.putText(frame, "OMNIMED MULTI-NODE SENSORS ACTIVE.", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 210, 255), 2)
+            
+            with frame_lock: latest_processed_frame = frame.copy()
+            cv2.imshow("OMNIMED ENGINE", frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'): is_system_running = False; break
+
+        self.tracker.close()
+        self.face_detector.close()
+        cap.release(); cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    is_system_running = True
+    
+    if sys.platform == "win32":
+        hardware_video_capture = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    else:
+        hardware_video_capture = cv2.VideoCapture(0)
+        
+    hardware_video_capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    hardware_video_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    
+    threading.Thread(target=hardware_buffer_cleaner, args=(hardware_video_capture,), daemon=True).start()
+    threading.Thread(target=launch_server, daemon=True).start()
+    threading.Thread(target=voice_recognition_worker, daemon=True).start()
+    
+    ai_engine = OmniMedAIVision()
+    ai_engine.run_engine(hardware_video_capture)
